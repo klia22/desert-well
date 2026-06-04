@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
 
     uint64_t offset = 0;
     uint64_t totalSeeds = 0x1'0000'0000ULL;
-    bool printSeeds = false;
+    bool printSeeds = true;
     bool progress = true;
 
     constexpr int W = 10;
@@ -109,6 +109,7 @@ int main(int argc, char** argv) {
 
             if (matched) {
                 ++localFound;
+                found.fetch_add(1, std::memory_order_relaxed);
                 if (printSeeds) localMatches.push_back(seed);
             }
 
@@ -120,7 +121,6 @@ int main(int argc, char** argv) {
         }
 
         if (localProcessed) processed.fetch_add(localProcessed, std::memory_order_relaxed);
-        if (localFound) found.fetch_add(localFound, std::memory_order_relaxed);
 
         if (!localMatches.empty()) {
             std::lock_guard<std::mutex> guard(outputMutex);
