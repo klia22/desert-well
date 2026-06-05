@@ -14,6 +14,7 @@ using namespace std::chrono;
 
 static atomic<bool> stopRequested{false};
 static atomic<uint64_t> foundCount{0};
+static atomic<uint64_t> candidateCount{0};
 static mutex outputMutex;
 
 enum Corner : int {
@@ -25,13 +26,13 @@ enum Corner : int {
 };
 
 static constexpr uint64_t TOTAL_UINT32 = 0x1'0000'0000ULL;
-static constexpr uint32_t REPORT_INTERVAL_SECONDS = 5;
-static constexpr int LOW12_BITS = 12;
-static constexpr uint32_t LOW12_SIZE = 1u << LOW12_BITS;
-static constexpr uint32_t LOW12_MASK = LOW12_SIZE - 1u;
-static constexpr int LOW12_WORDS = LOW12_SIZE / 64;
+static constexpr uint32_t REPORT_INTERVAL_SECONDS = 1;
+static constexpr uint64_t FLUSH_INTERVAL = 1ull << 16; // 64k
+// Use larger lower-bit hash buckets to speed up filtering (default 20 bits)
+static constexpr int LOWER_BITS = 20;
+static constexpr uint32_t LOWER_SIZE = 1u << LOWER_BITS;
+static constexpr uint32_t LOWER_MASK = LOWER_SIZE - 1u;
 
-using Low12Mask = array<uint64_t, LOW12_WORDS>;
 
 static constexpr array<pair<int, int>, CORNER_COUNT> cornerOffsets = {
     pair{1, 1},   // NW
@@ -44,28 +45,10 @@ void handleSigint(int) {
     stopRequested.store(true, memory_order_relaxed);
 }
 
-inline void low12Set(Low12Mask &mask, uint32_t idx) noexcept {
-    mask[idx >> 6] |= 1ull << (idx & 63);
-}
-
 inline uint32_t computeRegionSeedFromBase(uint32_t base) noexcept {
     return base ^ (DW::FEATURE_KEY + (base << 6) + (base >> 2) - 1640531527u);
 }
 
-inline bool low12Any(const Low12Mask &mask) noexcept {
-    for (uint64_t w : mask) {
-        if (w) return true;
-    }
-    return false;
-}
-
-inline Low12Mask low12And(const Low12Mask &a, const Low12Mask &b) noexcept {
-    Low12Mask result{};
-    for (int i = 0; i < LOW12_WORDS; ++i) {
-        result[i] = a[i] & b[i];
-    }
-    return result;
-}
 
 inline int countTrailingZeros(uint64_t value) noexcept {
     return value ? __builtin_ctzll(value) : 64;
@@ -75,10 +58,11 @@ inline void printProgress(const string &phaseName, uint64_t processed, uint64_t 
     lock_guard<mutex> guard(outputMutex);
     double percent = total ? (100.0 * processed / double(total)) : 0.0;
     cerr << "[" << phaseName << "] "
-         << fixed << setprecision(2) << percent << "% (" << processed << "/" << total << ")"
+         << fixed << setprecision(3) << percent << "% (" << processed << "/" << total << ")"
          << " rate=" << rate << "/s";
     if (phaseName == "search") {
-        cerr << " found=" << foundCount.load(memory_order_relaxed);
+        cerr << " found=" << foundCount.load(memory_order_relaxed)
+             << " candidates=" << candidateCount.load(memory_order_relaxed);
     }
     cerr << '\n';
 }
@@ -155,7 +139,7 @@ struct PhaseStatus {
 void reporterThread(const PhaseStatus &status) {
     uint64_t lastProcessed = 0;
     auto lastTime = steady_clock::now();
-    while (!stopRequested.load(memory_order_relaxed)) {
+    while (!stopRequested.load(memory_order_relaxed) && status.processed.load(memory_order_relaxed) < status.total) {
         this_thread::sleep_for(seconds(REPORT_INTERVAL_SECONDS));
         if (stopRequested.load(memory_order_relaxed)) break;
         auto now = steady_clock::now();
@@ -166,6 +150,9 @@ void reporterThread(const PhaseStatus &status) {
         lastTime = now;
         lastProcessed = current;
     }
+    // Print final state once when exiting (either complete or stopped)
+    uint64_t current = status.processed.load(memory_order_relaxed);
+    printProgress(status.name, current, status.total, 0.0);
 }
 
 int main(int argc, char **argv) {
@@ -174,23 +161,28 @@ int main(int argc, char **argv) {
 
     unsigned threadCount = thread::hardware_concurrency();
     if (threadCount == 0) threadCount = 1;
+    // Default to searching ~2^22 seeds (user-specified optimization)
+    uint64_t limitTotal = 1ull << 22;
 
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
         if (arg == "--threads" && i + 1 < argc) {
             threadCount = unsigned(stoi(argv[++i]));
+        } else if (arg == "--limit" && i + 1 < argc) {
+            limitTotal = stoull(argv[++i]);
+            if (limitTotal == 0) limitTotal = TOTAL_UINT32;
         }
     }
 
     signal(SIGINT, handleSigint);
 
     vector<vector<uint32_t>> validBases(CORNER_COUNT);
-    PhaseStatus baseStatus{"base-scan", TOTAL_UINT32};
+    PhaseStatus baseStatus{"base-scan", limitTotal};
 
     auto baseWorker = [&](unsigned tid) {
-        uint64_t blockSize = (TOTAL_UINT32 + threadCount - 1) / threadCount;
+        uint64_t blockSize = (limitTotal + threadCount - 1) / threadCount;
         uint64_t start = uint64_t(tid) * blockSize;
-        uint64_t end = min(start + blockSize, TOTAL_UINT32);
+        uint64_t end = min(start + blockSize, limitTotal);
         array<vector<uint32_t>, CORNER_COUNT> localLists{};
         uint64_t localProcessed = 0;
 
@@ -200,7 +192,7 @@ int main(int argc, char **argv) {
             DW::RandWrapper rng(regionSeed);
             if (rng.nextInt<500>() != 0u) {
                 ++localProcessed;
-                if ((localProcessed & 0x3FFFFF) == 0) {
+                if ((localProcessed & (FLUSH_INTERVAL - 1)) == 0) {
                     baseStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
                     localProcessed = 0;
                 }
@@ -209,13 +201,27 @@ int main(int argc, char **argv) {
             uint32_t offZ = rng.nextInt<16>();
             uint32_t offX = rng.nextInt<16>();
             for (int corner = 0; corner < CORNER_COUNT; ++corner) {
-                if (offX == uint32_t(cornerOffsets[corner].first) && offZ == uint32_t(cornerOffsets[corner].second)) {
+                // Accept a 5x5 corner region: x,z in 0..4 (low) or 11..15 (high)
+                auto inLowRange = [](uint32_t v) noexcept { return v <= 4u; };
+                auto inHighRange = [](uint32_t v) noexcept { return v >= 11u && v <= 15u; };
+                bool xLow = inLowRange(offX);
+                bool xHigh = inHighRange(offX);
+                bool zLow = inLowRange(offZ);
+                bool zHigh = inHighRange(offZ);
+                bool match = false;
+                switch (corner) {
+                    case NW: match = xLow && zLow; break;
+                    case NE: match = xHigh && zLow; break;
+                    case SW: match = xLow && zHigh; break;
+                    case SE: match = xHigh && zHigh; break;
+                }
+                if (match) {
                     localLists[corner].push_back(base);
                     break;
                 }
             }
             ++localProcessed;
-            if ((localProcessed & 0x3FFFFF) == 0) {
+            if ((localProcessed & (FLUSH_INTERVAL - 1)) == 0) {
                 baseStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
                 localProcessed = 0;
             }
@@ -238,10 +244,11 @@ int main(int argc, char **argv) {
     for (auto &t : baseThreads) t.join();
     stopRequested.store(false, memory_order_relaxed);
     if (baseReporter.joinable()) baseReporter.join();
+    cerr << "base phase complete\n";
 
     array<vector<uint32_t>, CORNER_COUNT> cornerSets;
-    array<Low12Mask, CORNER_COUNT> low12Mask{};
-    array<array<vector<uint32_t>, LOW12_SIZE>, CORNER_COUNT> low12Buckets;
+    array<unordered_map<uint32_t, vector<uint32_t>>, CORNER_COUNT> lowBuckets;
+    array<vector<uint32_t>, CORNER_COUNT> lowKeys;
 
     for (int corner = 0; corner < CORNER_COUNT; ++corner) {
         auto &list = validBases[corner];
@@ -249,9 +256,11 @@ int main(int argc, char **argv) {
         list.erase(unique(list.begin(), list.end()), list.end());
         cornerSets[corner] = move(list);
         for (uint32_t value : cornerSets[corner]) {
-            low12Set(low12Mask[corner], value & LOW12_MASK);
-            low12Buckets[corner][value & LOW12_MASK].push_back(value);
+            uint32_t low = value & LOWER_MASK;
+            lowBuckets[corner][low].push_back(value);
         }
+        lowKeys[corner].reserve(lowBuckets[corner].size());
+        for (auto &p : lowBuckets[corner]) lowKeys[corner].push_back(p.first);
         cerr << "corner " << corner << " candidates=" << cornerSets[corner].size() << "\n";
         if (cornerSets[corner].empty()) {
             cerr << "ERROR: no candidates for corner " << corner << "\n";
@@ -259,39 +268,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    array<array<Low12Mask, LOW12_SIZE>, 3> xorLow12Masks{};
-    array<array<uint8_t, LOW12_SIZE>, 3> low12Possible{};
-    array<Low12Mask, 3> baseLow12Mask = {low12Mask[SW], low12Mask[NE], low12Mask[NW]};
-
-    auto buildXorMasks = [&](int index, const Low12Mask &sourceMask) {
-        for (uint32_t x = 0; x < LOW12_SIZE; ++x) {
-            auto &mask = xorLow12Masks[index][x];
-            for (uint32_t low12 = 0; low12 < LOW12_SIZE; ++low12) {
-                uint32_t word = low12 >> 6;
-                uint64_t bit = 1ull << (low12 & 63);
-                if (sourceMask[word] & bit) {
-                    uint32_t target = low12 ^ x;
-                    mask[target >> 6] |= 1ull << (target & 63);
-                }
-            }
-            low12Possible[index][x] = low12Any(low12And(low12Mask[SE], xorLow12Masks[index][x]));
-        }
-    };
-
-    buildXorMasks(0, low12Mask[SW]); // xMul low12 from SW-SE
-    buildXorMasks(1, low12Mask[NE]); // zMul low12 from NE-SE
-    buildXorMasks(2, low12Mask[NW]); // xMul^zMul low12 from NW-SE
-
-    // Recompute the possibility tables for the actual target sets.
-    for (uint32_t x = 0; x < LOW12_SIZE; ++x) {
-        low12Possible[0][x] = low12Any(low12And(low12Mask[SE], xorLow12Masks[0][x]));
-        low12Possible[1][x] = low12Any(low12And(low12Mask[SE], xorLow12Masks[1][x]));
-        low12Possible[2][x] = low12Any(low12And(low12Mask[SE], xorLow12Masks[2][x]));
-    }
-
-    PhaseStatus searchStatus{"search", TOTAL_UINT32};
+    PhaseStatus searchStatus{"search", limitTotal};
     BestSolution best{0, 0, 0, 0, 0, 0, UINT64_MAX};
     mutex bestMutex;
+    
 
     auto isValidBase = [&](uint32_t baseSE, uint32_t xMul, uint32_t zMul) {
         uint32_t baseSW = baseSE ^ xMul;
@@ -304,9 +284,9 @@ int main(int argc, char **argv) {
     };
 
     auto searchWorker = [&](unsigned tid) {
-        uint64_t blockSize = (TOTAL_UINT32 + threadCount - 1) / threadCount;
+        uint64_t blockSize = (limitTotal + threadCount - 1) / threadCount;
         uint64_t start = uint64_t(tid) * blockSize;
-        uint64_t end = min(start + blockSize, TOTAL_UINT32);
+        uint64_t end = min(start + blockSize, limitTotal);
         uint64_t localProcessed = 0;
         BestSolution localBest{0, 0, 0, 0, 0, 0, UINT64_MAX};
 
@@ -315,55 +295,65 @@ int main(int argc, char **argv) {
             auto feat = DW::makeFeatureSeed(int64_t(seed));
             uint32_t xMul = feat.xMul;
             uint32_t zMul = feat.zMul;
-            uint32_t xLo12 = xMul & LOW12_MASK;
-            uint32_t zLo12 = zMul & LOW12_MASK;
-            uint32_t xzLo12 = xLo12 ^ zLo12;
+            uint32_t xLo = xMul & LOWER_MASK;
+            uint32_t zLo = zMul & LOWER_MASK;
+            uint32_t xzLo = xLo ^ zLo;
 
-            if (!low12Possible[0][xLo12] || !low12Possible[1][zLo12] || !low12Possible[2][xzLo12]) {
-                ++localProcessed;
-                if ((localProcessed & 0x3FFFFF) == 0) {
-                    searchStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
-                    localProcessed = 0;
+            // Choose the smallest low-key set among SE, SW, NE, NW to iterate
+            size_t szSE = lowKeys[SE].size();
+            size_t szSW = lowKeys[SW].size();
+            size_t szNE = lowKeys[NE].size();
+            size_t szNW = lowKeys[NW].size();
+            int iterCorner = SE;
+            size_t minSz = szSE;
+            if (szSW < minSz) { minSz = szSW; iterCorner = SW; }
+            if (szNE < minSz) { minSz = szNE; iterCorner = NE; }
+            if (szNW < minSz) { minSz = szNW; iterCorner = NW; }
+
+            bool anyFoundLow = false;
+            const auto &iterKeys = lowKeys[iterCorner];
+            for (uint32_t k : iterKeys) {
+                uint32_t candidateSE_low;
+                switch (iterCorner) {
+                    case SE: candidateSE_low = k; break;
+                    case SW: candidateSE_low = k ^ xLo; break;
+                    case NE: candidateSE_low = k ^ zLo; break;
+                    case NW: candidateSE_low = k ^ xzLo; break;
+                    default: candidateSE_low = k; break;
                 }
-                continue;
-            }
+                // Check presence across all corners using low-buckets
+                if (lowBuckets[SE].find(candidateSE_low) == lowBuckets[SE].end()) continue;
+                if (lowBuckets[SW].find(candidateSE_low ^ xLo) == lowBuckets[SW].end()) continue;
+                if (lowBuckets[NE].find(candidateSE_low ^ zLo) == lowBuckets[NE].end()) continue;
+                if (lowBuckets[NW].find(candidateSE_low ^ xzLo) == lowBuckets[NW].end()) continue;
 
-            Low12Mask candidateMask{};
-            for (int i = 0; i < LOW12_WORDS; ++i) {
-                candidateMask[i] = low12Mask[SE][i] & xorLow12Masks[0][xLo12][i] & xorLow12Masks[1][zLo12][i] & xorLow12Masks[2][xzLo12][i];
-            }
-            if (!low12Any(candidateMask)) {
-                ++localProcessed;
-                if ((localProcessed & 0x3FFFFF) == 0) {
-                    searchStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
-                    localProcessed = 0;
-                }
-                continue;
-            }
+                anyFoundLow = true;
+                candidateCount.fetch_add(1, memory_order_relaxed);
 
-            for (int word = 0; word < LOW12_WORDS; ++word) {
-                uint64_t w = candidateMask[word];
-                while (w) {
-                    int bit = countTrailingZeros(w);
-                    w &= w - 1;
-                    uint32_t low12 = (word << 6) + bit;
-                    for (uint32_t baseSE : low12Buckets[SE][low12]) {
-                        if (!isValidBase(baseSE, xMul, zMul)) continue;
-                        uint32_t baseO = seed ^ baseSE;
-                        BestSolution solution = nearestSolution(seed, xMul, zMul, baseO);
-                        if (solution.distanceSquared < localBest.distanceSquared) {
-                            localBest = solution;
-                        }
-                        foundCount.fetch_add(1, memory_order_relaxed);
-                        break;
+                // Iterate full bases for this low value
+                for (uint32_t baseSE : lowBuckets[SE][candidateSE_low]) {
+                    if (!isValidBase(baseSE, xMul, zMul)) continue;
+                    uint32_t baseO = seed ^ baseSE;
+                    BestSolution solution = nearestSolution(seed, xMul, zMul, baseO);
+                    if (solution.distanceSquared < localBest.distanceSquared) {
+                        localBest = solution;
                     }
-                    if (localBest.distanceSquared < UINT64_MAX) break;
+                    foundCount.fetch_add(1, memory_order_relaxed);
+                    break;
                 }
                 if (localBest.distanceSquared < UINT64_MAX) break;
             }
+            if (!anyFoundLow) {
+                ++localProcessed;
+                if ((localProcessed & (FLUSH_INTERVAL - 1)) == 0) {
+                    searchStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
+                    localProcessed = 0;
+                }
+                continue;
+            }
 
             ++localProcessed;
-            if ((localProcessed & 0x3FFFFF) == 0) {
+            if ((localProcessed & (FLUSH_INTERVAL - 1)) == 0) {
                 searchStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
                 localProcessed = 0;
             }
@@ -396,5 +386,7 @@ int main(int argc, char **argv) {
     } else {
         cerr << "No valid solution found in scanned range." << '\n';
     }
+    int a;
+    cin>>a;
     return 0;
 }
