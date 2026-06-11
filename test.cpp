@@ -3,9 +3,9 @@
 using namespace std;
 using namespace DW;
 int main() {
-    uint32_t worldSeed = 2589;
-    uint32_t chunkX = 273983839;
-    uint32_t chunkZ = -300695624;
+    uint32_t worldSeed = 536879937;
+    uint32_t chunkX = 26737318;
+    uint32_t chunkZ = -3496929;
     for(int ax = chunkX - 1; ax <= chunkX + 1; ++ax) {
         for(int az = chunkZ - 1; az <= chunkZ + 1; ++az) {
             auto result = findwell(worldSeed, ax, az);

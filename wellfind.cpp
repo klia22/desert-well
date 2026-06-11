@@ -28,10 +28,20 @@ enum Corner : int {
 
 static constexpr uint64_t TOTAL_UINT32 = 0x1'0000'0000ULL;
 static constexpr uint32_t REPORT_INTERVAL_SECONDS = 20;
-static constexpr uint64_t FLUSH_INTERVAL = 1ull << 16;
-static constexpr int LOWER_BITS = 20;
+static constexpr uint64_t FLUSH_INTERVAL = 1ull << 10;
+
+// Exact low24 filtering
+static constexpr int LOWER_BITS = 24;
 static constexpr uint32_t LOWER_SIZE = 1u << LOWER_BITS;
 static constexpr uint32_t LOWER_MASK = LOWER_SIZE - 1u;
+
+// MITM split for the low24 layer: 14 high bits + 10 low bits
+static constexpr int MITM_LOW_BITS = 10;
+static constexpr int MITM_HIGH_BITS = LOWER_BITS - MITM_LOW_BITS; // 14
+static constexpr uint32_t MITM_LOW_SIZE = 1u << MITM_LOW_BITS;    // 1024
+static constexpr uint32_t MITM_HIGH_SIZE = 1u << MITM_HIGH_BITS;  // 16384
+static constexpr uint32_t MITM_LOW_MASK = MITM_LOW_SIZE - 1u;
+static constexpr uint32_t MITM_HIGH_MASK = MITM_HIGH_SIZE - 1u;
 
 void handleSigint(int) {
     stopRequested.store(true, memory_order_relaxed);
@@ -80,7 +90,7 @@ inline DW::FeatureSeed fastMakeFeatureSeed(uint32_t seedLow32) noexcept {
         (raw0 >> 1) | 1u,
         (raw1 >> 1) | 1u,
         DW::FEATURE_KEY
-    };
+    }; // xMul and zMul: upper 31 bits random, last bit is 1 (always odd)
 }
 
 inline void printProgress(const string &phaseName, uint64_t processed, uint64_t total, double rate) {
@@ -94,12 +104,6 @@ inline void printProgress(const string &phaseName, uint64_t processed, uint64_t 
              << " candidates=" << candidateCount.load(memory_order_relaxed);
     }
     cerr << '\n';
-}
-
-inline uint64_t chebyshevDistance(int32_t x, int32_t z) noexcept {
-    uint64_t ax = uint64_t(llabs(x));
-    uint64_t az = uint64_t(llabs(z));
-    return max(ax, az);
 }
 
 bool solveLinearDiophantine(int64_t a, int64_t b, int64_t c,
@@ -135,7 +139,7 @@ struct BestSolution {
     uint32_t baseO;
     int32_t chunkX;
     int32_t chunkZ;
-    uint64_t distance; // exact min max(|x|, |z|)
+    uint64_t distance;
 };
 
 static inline __int128 iabs128(__int128 v) noexcept {
@@ -143,7 +147,6 @@ static inline __int128 iabs128(__int128 v) noexcept {
 }
 
 static inline __int128 floorDiv128(__int128 a, __int128 b) noexcept {
-    // b > 0
     __int128 q = a / b;
     __int128 r = a % b;
     if (r != 0 && a < 0) --q;
@@ -151,7 +154,6 @@ static inline __int128 floorDiv128(__int128 a, __int128 b) noexcept {
 }
 
 static inline __int128 ceilDiv128(__int128 a, __int128 b) noexcept {
-    // b > 0
     __int128 q = a / b;
     __int128 r = a % b;
     if (r != 0 && a > 0) ++q;
@@ -181,11 +183,9 @@ BestSolution nearestSolution(uint32_t seed, uint32_t xMul, uint32_t zMul, uint32
     auto feasible = [&](uint64_t D, __int128 &loK, __int128 &hiK) -> bool {
         __int128 d = (__int128)D;
 
-        // x = cx0 + k*stepX
         __int128 lo1 = ceilDiv128(-d - ax0, sx);
-        __int128 hi1 = floorDiv128( d - ax0, sx);
+        __int128 hi1 = floorDiv128(d - ax0, sx);
 
-        // z = cz0 - k*stepZ
         __int128 lo2 = ceilDiv128(az0 - d, sz);
         __int128 hi2 = floorDiv128(az0 + d, sz);
 
@@ -212,7 +212,6 @@ BestSolution nearestSolution(uint32_t seed, uint32_t xMul, uint32_t zMul, uint32
         return BestSolution{seed, xMul, zMul, baseO, 0, 0, UINT64_MAX};
     }
 
-    // Any k in [kLo, kHi] is optimal now.
     __int128 k = kLo;
     __int128 bestCx = ax0 + k * sx;
     __int128 bestCz = az0 - k * sz;
@@ -227,6 +226,7 @@ BestSolution nearestSolution(uint32_t seed, uint32_t xMul, uint32_t zMul, uint32
         lo
     };
 }
+
 struct PhaseStatus {
     string name;
     uint64_t total;
@@ -236,9 +236,12 @@ struct PhaseStatus {
 void reporterThread(const PhaseStatus &status) {
     uint64_t lastProcessed = 0;
     auto lastTime = steady_clock::now();
-    while (!stopRequested.load(memory_order_relaxed) && status.processed.load(memory_order_relaxed) < status.total) {
+
+    while (!stopRequested.load(memory_order_relaxed) &&
+           status.processed.load(memory_order_relaxed) < status.total) {
         this_thread::sleep_for(seconds(REPORT_INTERVAL_SECONDS));
         if (stopRequested.load(memory_order_relaxed)) break;
+
         auto now = steady_clock::now();
         double elapsed = duration<double>(now - lastTime).count();
         uint64_t current = status.processed.load(memory_order_relaxed);
@@ -247,32 +250,233 @@ void reporterThread(const PhaseStatus &status) {
         lastTime = now;
         lastProcessed = current;
     }
+
     uint64_t current = status.processed.load(memory_order_relaxed);
     printProgress(status.name, current, status.total, 0.0);
 }
 
-struct BucketTable {
-    array<uint32_t, LOWER_SIZE> begin{};
-    array<uint32_t, LOWER_SIZE> count{};
-    array<uint8_t, LOWER_SIZE> present{};
-    vector<uint32_t> keys;
+struct alignas(64) RowMask1024 {
+    uint64_t w[16]{};
+};
+
+static inline bool anyMask(const RowMask1024 &m) noexcept {
+    for (uint64_t v : m.w) {
+        if (v) return true;
+    }
+    return false;
+}
+
+static inline void andMask(RowMask1024 &a, const RowMask1024 &b) noexcept {
+    for (int i = 0; i < 16; ++i) a.w[i] &= b.w[i];
+}
+
+static inline void orMask(RowMask1024 &a, const RowMask1024 &b) noexcept {
+    for (int i = 0; i < 16; ++i) a.w[i] |= b.w[i];
+}
+
+static inline uint64_t swapBits64(uint64_t x, uint64_t mask, unsigned shift) noexcept {
+    uint64_t t = ((x >> shift) ^ x) & mask;
+    return x ^ t ^ (t << shift);
+}
+
+static inline void swapWordBlocks(RowMask1024 &m, unsigned blockWords) noexcept {
+    const unsigned step = blockWords * 2u;
+    for (unsigned base = 0; base < 16; base += step) {
+        for (unsigned j = 0; j < blockWords; ++j) {
+            std::swap(m.w[base + j], m.w[base + blockWords + j]);
+        }
+    }
+}
+
+static inline void xorPermute1024(RowMask1024 &m, uint32_t x) noexcept {
+    if (x & 1u)  for (int i = 0; i < 16; ++i) m.w[i] = swapBits64(m.w[i], 0x5555555555555555ull, 1);
+    if (x & 2u)  for (int i = 0; i < 16; ++i) m.w[i] = swapBits64(m.w[i], 0x3333333333333333ull, 2);
+    if (x & 4u)  for (int i = 0; i < 16; ++i) m.w[i] = swapBits64(m.w[i], 0x0f0f0f0f0f0f0f0full, 4);
+    if (x & 8u)  for (int i = 0; i < 16; ++i) m.w[i] = swapBits64(m.w[i], 0x00ff00ff00ff00ffull, 8);
+    if (x & 16u) for (int i = 0; i < 16; ++i) m.w[i] = swapBits64(m.w[i], 0x0000ffff0000ffffull, 16);
+    if (x & 32u) for (int i = 0; i < 16; ++i) m.w[i] = swapBits64(m.w[i], 0x00000000ffffffffull, 32);
+
+    if (x & 64u)  swapWordBlocks(m, 1);
+    if (x & 128u) swapWordBlocks(m, 2);
+    if (x & 256u) swapWordBlocks(m, 4);
+    if (x & 512u) swapWordBlocks(m, 8);
+}
+
+static inline RowMask1024 rotateRight1024(const RowMask1024 &in, unsigned r) noexcept {
+    RowMask1024 out{};
+    r &= 1023u;
+    unsigned wordShift = r >> 6;
+    unsigned bitShift = r & 63u;
+
+    if (bitShift == 0u) {
+        for (unsigned i = 0; i < 16; ++i) {
+            out.w[i] = in.w[(i + wordShift) & 15u];
+        }
+        return out;
+    }
+
+    unsigned bitShift2 = 64u - bitShift;
+    for (unsigned i = 0; i < 16; ++i) {
+        uint64_t a = in.w[(i + wordShift) & 15u];
+        uint64_t b = in.w[(i + wordShift + 1u) & 15u];
+        out.w[i] = (a >> bitShift) | (b << bitShift2);
+    }
+    return out;
+}
+
+static inline RowMask1024 makePrefixMask1024(uint32_t bits) noexcept {
+    RowMask1024 m{};
+    if (bits == 0) return m;
+
+    uint32_t fullWords = bits / 64u;
+    uint32_t rem = bits % 64u;
+
+    for (uint32_t i = 0; i < fullWords; ++i) {
+        m.w[i] = ~0ull;
+    }
+    if (rem != 0u && fullWords < 16u) {
+        m.w[fullWords] = (1ull << rem) - 1ull;
+    }
+    return m;
+}
+
+static array<RowMask1024, MITM_LOW_SIZE> carryMask0;
+static array<RowMask1024, MITM_LOW_SIZE> carryMask1;
+
+static void initCarryMasks() {
+    for (uint32_t d = 0; d < MITM_LOW_SIZE; ++d) {
+        carryMask0[d] = makePrefixMask1024(MITM_LOW_SIZE - d);
+        for (int i = 0; i < 16; ++i) {
+            carryMask1[d].w[i] = ~carryMask0[d].w[i];
+        }
+    }
+}
+
+struct BucketTable24 {
+    static constexpr uint32_t BUCKET_SHIFT = MITM_LOW_BITS;   // 10
+    static constexpr uint32_t BUCKET_SIZE = MITM_HIGH_SIZE;    // 16384
+
+    array<uint32_t, BUCKET_SIZE> begin{};
+    array<uint32_t, BUCKET_SIZE> count{};
+    array<uint8_t, BUCKET_SIZE> present{};
+    vector<uint32_t> low24Keys;
     vector<uint32_t> values;
 
+    inline pair<uint32_t, uint32_t> exactRange(uint32_t low24) const noexcept {
+        uint32_t bucket = low24 >> BUCKET_SHIFT;
+        if (!present[bucket]) return {0, 0};
+
+        uint32_t b = begin[bucket];
+        uint32_t e = b + count[bucket];
+
+        auto lb = lower_bound(low24Keys.begin() + b, low24Keys.begin() + e, low24);
+        auto ub = upper_bound(lb, low24Keys.begin() + e, low24);
+
+        return {
+            uint32_t(lb - low24Keys.begin()),
+            uint32_t(ub - low24Keys.begin())
+        };
+    }
+
     inline bool contains(uint32_t value) const noexcept {
-        uint32_t low = value & LOWER_MASK;
-        if (!present[low]) return false;
-        uint32_t b = begin[low];
-        uint32_t e = b + count[low];
-        return binary_search(values.begin() + b, values.begin() + e, value);
+        uint32_t low24 = value & LOWER_MASK;
+        auto [lb, ub] = exactRange(low24);
+        if (lb == ub) return false;
+        return binary_search(values.begin() + lb, values.begin() + ub, value);
     }
 };
 
-static inline uint32_t low20(uint32_t v) noexcept {
-    return v & LOWER_MASK;
+static array<vector<uint32_t>, CORNER_COUNT> cornerSets;
+static array<BucketTable24, CORNER_COUNT> tables;
+static array<vector<RowMask1024>, CORNER_COUNT> cornerRows;
+
+static void buildCornerArtifacts(int corner) {
+    auto &set = cornerSets[corner];
+    auto &tbl = tables[corner];
+    auto &rows = cornerRows[corner];
+
+    rows.assign(MITM_HIGH_SIZE, RowMask1024{});
+
+    vector<pair<uint32_t, uint32_t>> items;
+    items.reserve(set.size());
+
+    for (uint32_t v : set) {
+        items.emplace_back(v & LOWER_MASK, v);
+    }
+
+    sort(items.begin(), items.end(), [](const auto &a, const auto &b) {
+        if (a.first != b.first) return a.first < b.first;
+        return a.second < b.second;
+    });
+
+    uint32_t prevLow24 = UINT32_MAX;
+    for (const auto &it : items) {
+        uint32_t low24 = it.first;
+        if (low24 != prevLow24) {
+            uint32_t row = low24 >> MITM_LOW_BITS;
+            uint32_t bit = low24 & MITM_LOW_MASK;
+            rows[row].w[bit >> 6] |= 1ull << (bit & 63u);
+            prevLow24 = low24;
+        }
+    }
+
+    tbl.begin.fill(0);
+    tbl.count.fill(0);
+    tbl.present.fill(0);
+    tbl.low24Keys.clear();
+    tbl.values.clear();
+    tbl.low24Keys.reserve(items.size());
+    tbl.values.reserve(items.size());
+
+    size_t i = 0;
+    while (i < items.size()) {
+        uint32_t bucket = items[i].first >> BucketTable24::BUCKET_SHIFT;
+        tbl.present[bucket] = 1;
+        tbl.begin[bucket] = uint32_t(tbl.values.size());
+
+        size_t j = i;
+        while (j < items.size() && (items[j].first >> BucketTable24::BUCKET_SHIFT) == bucket) {
+            tbl.low24Keys.push_back(items[j].first);
+            tbl.values.push_back(items[j].second);
+            ++j;
+        }
+
+        tbl.count[bucket] = uint32_t(j - i);
+        i = j;
+    }
 }
 
-array<vector<uint32_t>, CORNER_COUNT> cornerSets;
-array<BucketTable, CORNER_COUNT> tables;
+static inline RowMask1024 buildCornerMask(
+    const RowMask1024 *rows,
+    uint32_t seedHigh14,
+    uint32_t seedLow10,
+    uint32_t uHigh14,
+    uint32_t deltaHigh14,
+    uint32_t deltaLow10
+) noexcept {
+    RowMask1024 out{};
+
+    uint32_t sum0 = (uHigh14 + deltaHigh14) & MITM_HIGH_MASK;
+    uint32_t row0 = seedHigh14 ^ sum0;
+
+    out = rows[row0];
+    xorPermute1024(out, seedLow10);
+    out = rotateRight1024(out, deltaLow10);
+    andMask(out, carryMask0[deltaLow10]);
+
+    if (deltaLow10 != 0u) {
+        uint32_t sum1 = (sum0 + 1u) & MITM_HIGH_MASK;
+        uint32_t row1 = seedHigh14 ^ sum1;
+
+        RowMask1024 extra = rows[row1];
+        xorPermute1024(extra, seedLow10);
+        extra = rotateRight1024(extra, deltaLow10);
+        andMask(extra, carryMask1[deltaLow10]);
+        orMask(out, extra);
+    }
+
+    return out;
+}
 
 int main(int argc, char **argv) {
     ios::sync_with_stdio(false);
@@ -293,6 +497,7 @@ int main(int argc, char **argv) {
     }
 
     signal(SIGINT, handleSigint);
+    initCarryMasks();
 
     vector<vector<uint32_t>> validBases(CORNER_COUNT);
     PhaseStatus baseStatus{"base-scan", limitTotal};
@@ -301,6 +506,7 @@ int main(int argc, char **argv) {
         uint64_t blockSize = (limitTotal + threadCount - 1) / threadCount;
         uint64_t start = uint64_t(tid) * blockSize;
         uint64_t end = min(start + blockSize, limitTotal);
+
         array<vector<uint32_t>, CORNER_COUNT> localLists{};
         uint64_t localProcessed = 0;
 
@@ -308,6 +514,7 @@ int main(int argc, char **argv) {
             uint32_t base = uint32_t(value);
             uint32_t regionSeed = computeRegionSeedFromBase(base);
             DW::RandWrapper rng(regionSeed);
+
             if (rng.nextInt<500>() != 0u) {
                 ++localProcessed;
                 if ((localProcessed & (FLUSH_INTERVAL - 1)) == 0) {
@@ -319,6 +526,7 @@ int main(int argc, char **argv) {
 
             uint32_t offZ = rng.nextInt<16>();
             uint32_t offX = rng.nextInt<16>();
+
             auto inLowRange = [](uint32_t v) noexcept { return v <= 4u; };
             auto inHighRange = [](uint32_t v) noexcept { return v >= 11u && v <= 15u; };
 
@@ -349,6 +557,7 @@ int main(int argc, char **argv) {
         }
 
         baseStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
+
         lock_guard<mutex> guard(outputMutex);
         for (int corner = 0; corner < CORNER_COUNT; ++corner) {
             auto &globalList = validBases[corner];
@@ -358,6 +567,7 @@ int main(int argc, char **argv) {
     };
 
     vector<thread> baseThreads;
+    baseThreads.reserve(threadCount);
     for (unsigned t = 0; t < threadCount; ++t) {
         baseThreads.emplace_back(baseWorker, t);
     }
@@ -366,6 +576,7 @@ int main(int argc, char **argv) {
     for (auto &t : baseThreads) t.join();
     stopRequested.store(false, memory_order_relaxed);
     if (baseReporter.joinable()) baseReporter.join();
+
     cerr << "base phase complete\n";
 
     for (int corner = 0; corner < CORNER_COUNT; ++corner) {
@@ -374,31 +585,7 @@ int main(int argc, char **argv) {
         list.erase(unique(list.begin(), list.end()), list.end());
         cornerSets[corner] = move(list);
 
-        auto &tbl = tables[corner];
-        vector<pair<uint32_t, uint32_t>> items;
-        items.reserve(cornerSets[corner].size());
-        for (uint32_t v : cornerSets[corner]) {
-            items.push_back({v & LOWER_MASK, v});
-        }
-
-        sort(items.begin(), items.end(), [](const auto &a, const auto &b) {
-            if (a.first != b.first) return a.first < b.first;
-            return a.second < b.second;
-        });
-
-        for (size_t i = 0; i < items.size(); ) {
-            uint32_t low = items[i].first;
-            tbl.present[low] = 1;
-            tbl.begin[low] = uint32_t(tbl.values.size());
-            tbl.keys.push_back(low);
-            size_t j = i;
-            while (j < items.size() && items[j].first == low) {
-                tbl.values.push_back(items[j].second);
-                ++j;
-            }
-            tbl.count[low] = uint32_t(j - i);
-            i = j;
-        }
+        buildCornerArtifacts(corner);
 
         cerr << "corner " << corner << " candidates=" << cornerSets[corner].size() << "\n";
         if (cornerSets[corner].empty()) {
@@ -411,87 +598,111 @@ int main(int argc, char **argv) {
     BestSolution best{0, 0, 0, 0, 0, 0, UINT64_MAX};
     mutex bestMutex;
 
-    int iterCorner = SE;
-    if (tables[SW].keys.size() < tables[iterCorner].keys.size()) iterCorner = SW;
-    if (tables[NE].keys.size() < tables[iterCorner].keys.size()) iterCorner = NE;
-    if (tables[NW].keys.size() < tables[iterCorner].keys.size()) iterCorner = NW;
-
     auto searchWorker = [&](unsigned tid) {
         uint64_t blockSize = (limitTotal + threadCount - 1) / threadCount;
         uint64_t start = uint64_t(tid) * blockSize;
         uint64_t end = min(start + blockSize, limitTotal);
+
         uint64_t localProcessed = 0;
         BestSolution localBest{0, 0, 0, 0, 0, 0, UINT64_MAX};
+
+        const auto *seRows = cornerRows[SE].data();
+        const auto *swRows = cornerRows[SW].data();
+        const auto *neRows = cornerRows[NE].data();
+        const auto *nwRows = cornerRows[NW].data();
 
         const auto &seTbl = tables[SE];
         const auto &swTbl = tables[SW];
         const auto &neTbl = tables[NE];
         const auto &nwTbl = tables[NW];
-        const auto &iterKeys = tables[iterCorner].keys;
 
         for (uint64_t value = start; value < end && !stopRequested.load(memory_order_relaxed); ++value) {
             uint32_t seed = uint32_t(value);
             auto feat = fastMakeFeatureSeed(seed);
+
             uint32_t xMul = feat.xMul;
             uint32_t zMul = feat.zMul;
-            uint32_t seedLow = seed & LOWER_MASK;
-            uint32_t xLo = xMul & LOWER_MASK;
-            uint32_t zLo = zMul & LOWER_MASK;
-            uint32_t xzLo = (xLo + zLo) & LOWER_MASK;
 
-            auto toSELow = [&](int corner, uint32_t k) -> uint32_t {
-                switch (corner) {
-                    case SE: return k;
-                    case SW: return (seedLow ^ ((seedLow ^ k) - xLo)) & LOWER_MASK;
-                    case NE: return (seedLow ^ ((seedLow ^ k) - zLo)) & LOWER_MASK;
-                    case NW: return (seedLow ^ ((seedLow ^ k) - xzLo)) & LOWER_MASK;
-                    default: return k;
+            uint32_t seedLow24 = seed & LOWER_MASK;
+            uint32_t seedLow10 = seedLow24 & MITM_LOW_MASK;
+            uint32_t seedHigh14 = (seedLow24 >> MITM_LOW_BITS) & MITM_HIGH_MASK;
+
+            uint32_t xLow24 = xMul & LOWER_MASK;
+            uint32_t zLow24 = zMul & LOWER_MASK;
+            uint32_t xzLow24 = (xLow24 + zLow24) & LOWER_MASK;
+
+            uint32_t xLow10 = xLow24 & MITM_LOW_MASK;
+            uint32_t zLow10 = zLow24 & MITM_LOW_MASK;
+            uint32_t xzLow10 = xzLow24 & MITM_LOW_MASK;
+
+            uint32_t xHigh14 = (xLow24 >> MITM_LOW_BITS) & MITM_HIGH_MASK;
+            uint32_t zHigh14 = (zLow24 >> MITM_LOW_BITS) & MITM_HIGH_MASK;
+            uint32_t xzHigh14 = (xzLow24 >> MITM_LOW_BITS) & MITM_HIGH_MASK;
+
+            for (uint32_t uHigh14 = 0; uHigh14 < MITM_HIGH_SIZE && !stopRequested.load(memory_order_relaxed); ++uHigh14) {
+                RowMask1024 maskSE = buildCornerMask(seRows, seedHigh14, seedLow10, uHigh14, 0u, 0u);
+                if (!anyMask(maskSE)) continue;
+
+                RowMask1024 maskSW = buildCornerMask(swRows, seedHigh14, seedLow10, uHigh14, xHigh14, xLow10);
+                if (!anyMask(maskSW)) continue;
+
+                RowMask1024 maskNE = buildCornerMask(neRows, seedHigh14, seedLow10, uHigh14, zHigh14, zLow10);
+                if (!anyMask(maskNE)) continue;
+
+                RowMask1024 maskNW = buildCornerMask(nwRows, seedHigh14, seedLow10, uHigh14, xzHigh14, xzLow10);
+                if (!anyMask(maskNW)) continue;
+
+                andMask(maskSE, maskSW);
+                if (!anyMask(maskSE)) continue;
+
+                andMask(maskSE, maskNE);
+                if (!anyMask(maskSE)) continue;
+
+                andMask(maskSE, maskNW);
+                if (!anyMask(maskSE)) continue;
+
+                for (int word = 0; word < 16; ++word) {
+                    uint64_t bits = maskSE.w[word];
+                    while (bits) {
+                        unsigned bit = unsigned(__builtin_ctzll(bits));
+                        bits &= (bits - 1);
+
+                        uint32_t uLow10 = uint32_t(word * 64 + bit);
+                        uint32_t u24 = (uHigh14 << MITM_LOW_BITS) | uLow10;
+                        uint32_t baseSELow24 = seedLow24 ^ u24;
+
+                        auto [lb, ub] = seTbl.exactRange(baseSELow24);
+                        if (lb == ub) continue;
+
+                        for (uint32_t idx = lb; idx < ub; ++idx) {
+                            if ((idx & 1023u) == 0u && stopRequested.load(memory_order_relaxed)) {
+                                break;
+                            }
+
+                            uint32_t baseSE = seTbl.values[idx];
+                            uint32_t cSE = seed ^ baseSE;
+
+                            uint32_t baseSW = seed ^ (cSE + xMul);
+                            uint32_t baseNE = seed ^ (cSE + zMul);
+                            uint32_t baseNW = seed ^ (cSE + xMul + zMul);
+
+                            if (!swTbl.contains(baseSW)) continue;
+                            if (!neTbl.contains(baseNE)) continue;
+                            if (!nwTbl.contains(baseNW)) continue;
+
+                            candidateCount.fetch_add(1, memory_order_relaxed);
+                            foundCount.fetch_add(1, memory_order_relaxed);
+
+                            uint32_t baseO = cSE;
+                            BestSolution solution = nearestSolution(seed, xMul, zMul, baseO);
+                            if (solution.distance < localBest.distance) {
+                                localBest = solution;
+                            }
+                        }
+                    }
                 }
-            };
-
-            auto fromSELow = [&](uint32_t baseSELow, uint32_t deltaLow) -> uint32_t {
-                return (seedLow ^ ((seedLow ^ baseSELow) + deltaLow)) & LOWER_MASK;
-            };
-            for (uint32_t k : iterKeys) {
-                uint32_t candidateSE_low = toSELow(iterCorner, k);
-                uint32_t swLow = fromSELow(candidateSE_low, xLo);
-                uint32_t neLow = fromSELow(candidateSE_low, zLo);
-                uint32_t nwLow = fromSELow(candidateSE_low, xzLo);
-
-                if (!seTbl.present[candidateSE_low]) continue;
-                if (!swTbl.present[swLow]) continue;
-                if (!neTbl.present[neLow]) continue;
-                if (!nwTbl.present[nwLow]) continue;
-
-                uint32_t b = seTbl.begin[candidateSE_low];
-                uint32_t e = b + seTbl.count[candidateSE_low];
-
-                for (uint32_t idx = b; idx < e; ++idx) {
-    			if ((idx & 1023u) == 0u && stopRequested.load(memory_order_relaxed)) {
-        			break;
-    			}
-
-    			uint32_t baseSE = seTbl.values[idx];
-   			uint32_t cSE = seed ^ baseSE;
-
-    			uint32_t baseSW = seed ^ (cSE + xMul);
-    			uint32_t baseNE = seed ^ (cSE + zMul);
-    			uint32_t baseNW = seed ^ (cSE + xMul + zMul);
-
-    			if (!swTbl.contains(baseSW)) continue;
-    			if (!neTbl.contains(baseNE)) continue;
-    			if (!nwTbl.contains(baseNW)) continue;
-
-    			candidateCount.fetch_add(1, memory_order_relaxed);
-    			foundCount.fetch_add(1, memory_order_relaxed);
-
-    			uint32_t baseO = cSE;
-    			BestSolution solution = nearestSolution(seed, xMul, zMul, baseO);
-    			if (solution.distance < localBest.distance) {
-        			localBest = solution;
-    			}
-		}
             }
+
             ++localProcessed;
             if ((localProcessed & (FLUSH_INTERVAL - 1)) == 0) {
                 searchStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
@@ -500,6 +711,7 @@ int main(int argc, char **argv) {
         }
 
         searchStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
+
         if (localBest.distance < UINT64_MAX) {
             lock_guard<mutex> guard(bestMutex);
             if (localBest.distance < best.distance) {
@@ -509,6 +721,7 @@ int main(int argc, char **argv) {
     };
 
     vector<thread> searchThreads;
+    searchThreads.reserve(threadCount);
     for (unsigned t = 0; t < threadCount; ++t) {
         searchThreads.emplace_back(searchWorker, t);
     }
