@@ -1,3 +1,4 @@
+//Reference well implementation, not optimized
 #ifndef WELL_H
 #define WELL_H
 
