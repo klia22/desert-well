@@ -4,18 +4,16 @@
 
 Minecraft Bedrock Edition places desert wells via a pseudo‑random lottery. The process for a given world seed (64‑bit signed) and chunk coordinates (X,Z) is:
 
-1. Derive structure multipliers `xMul` and `zMul` from the world seed via the Mersenne Twister.
+1. Derive structure multipliers `xMul` and `zMul` from the world seed via the MT19937_32.
 2. Compute a region seed  
    R = S XOR (xMul * X + zMul * Z)   (mod 2^32, signed)  
    where S is the lower 32 bits of the world seed.
 3. Use R as an RNG seed to draw a lottery: `nextInt<500>() == 0` (probability 1/500).
 4. If the lottery succeeds, two more RNG calls choose an offset inside the 16×16 block, yielding final world coordinates.
 
-We wanted to find seeds that produce a well in a **2×2 chunk section** (NW, NE, SW, SE) with specific offset ranges (0‑4 for low, 11‑15 for high), and use specific pairs of low and high to form each corner. A naive brute‑force approach would enumerate all world seeds and, for each, examine many chunk coordinates. Since the structure multipliers depend only on the lower 32 bits (structural potential), the core search space is 2^32 lower‑32 seeds. If one were to test all possible chunk coordinates in a 2^24 × 2^24 chunk grid (size chosen because of practical bedrock edition distance), the total number of seed‑chunk‑corner evaluations would be 2^24 × 2^24 × 2^32 = 2^80 structure calls (which includes its own 624 MT states). Tackling the problem this way, even with many optimizations, is astronomically impossible.
+We wanted to find seeds that produce a well in a **2×2 chunk section** (NW, NE, SW, SE) with specific offset ranges (0‑4 for low, 11‑15 for high), and use specific pairs of low and high to form each corner. A naive brute‑force approach would enumerate all world seeds and, for each, examine many chunk coordinates. Since the structure multipliers depend only on the lower 32 bits (structural potential), the core search space is 2^32 lower‑32 seeds. If one were to test all possible chunk coordinates in a 2^24 × 2^24 chunk grid, the total number of seed‑chunk‑corner evaluations would be 2^24 × 2^24 × 2^32 = 2^80 structure calls (which includes its own 624 MT states per each check). Tackling the problem this way, even with many optimizations, is astronomically impossible.
 
 ## Precomputing the Base Seeds
-
-## Precomputing the Structure Calls
 
 We observed that once the region seed R is computed from the world seed and chunk coordinates, all subsequent structure placement decisions – the 1/500 chance and the two offset draws – depend **only on R**. Since there are only 2^32 values of R, we could replace the per‑seed structure RNG testing with a **one‑time exhaustive precomputation**:
 
@@ -25,7 +23,7 @@ We observed that once the region seed R is computed from the world seed and chun
 
 This **base‑scanning phase** runs only once, producing four lists L_NW, L_NE, L_SW, L_SE of “good” region seeds. The size of each list is far smaller than 2^32 because it requires both the 1/500 chance and the specific offset windows. After this step, the expensive RNG logic is never needed again. The reduction is enormous: we traded the infeasible 2^80 per‑seed chunk evaluations for a single 2^32 scan (which is extremely fast, taking just 30 minutes on typical CPU), and the remaining search space becomes a 2^64 candidate check.
 
-## The Intermediate 2^64 / Rarity Stage
+## Algorithm After Precomputation.
 
 With the precomputed corner sets, the problem becomes: for each world seed S (lower 32 bits), find a value U = xMul * X + zMul * Z such that four simultaneous inclusions hold:
 
@@ -34,7 +32,7 @@ With the precomputed corner sets, the problem becomes: for each world seed S (lo
     S XOR (U + zMul)      ∈ L_SW
     S XOR (U + xMul + zMul) ∈ L_SE
 
-If we naively scanned all 2^32 possible U for each of the 2^32 seeds, the total work would be 2^64 checks. Considering rarity checks, this can be simplified to ~2^42. This is already a huge improvement from 2^80, but still far too large for a normal CPU, although extremely fast CPUs may still be able to handle it in reasonable amount of time. But there exists further optimizations.
+If we naively scanned all 2^32 possible U for each of the 2^32 seeds, the total work would be 2^64 checks. Considering rarity checks, this can be simplified to ~2^44. This is already a huge improvement from 2^80, but still far too large for a normal CPU, although extremely fast CPUs may still be able to handle it in reasonable amount of time. But there exists further optimizations.
 
 ## Adding MITM
 
