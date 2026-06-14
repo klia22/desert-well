@@ -1,4 +1,4 @@
-# Summary of the Algorithmic Process to Find Quad-Wells at Corner Chunks
+# Summary of the Algorithmic Process
 
 ## The Brute‑Force Baseline
 
@@ -8,10 +8,10 @@ Minecraft Bedrock Edition places desert wells via a pseudo‑random lottery. The
 2. Compute a region seed  
    R = S XOR (xMul * X + zMul * Z)   (mod 2^32, signed)  
    where S is the lower 32 bits of the world seed.
-3. Use R as an RNG seed to draw a lottery: `nextInt<500>() == 0` (probability 1/500).
-4. If the lottery succeeds, two more RNG calls choose an offset inside the 16×16 block, yielding final world coordinates.
+3. Use R as an RNG seed to draw a PRNG MT call: `nextInt<500>() == 0` (probability 1/500).
+4. If the PRNG MT call succeeds, two more PRNG calls choose an offset inside the 16×16 block, yielding final world coordinates.
 
-We wanted to find seeds that produce a well in a **2×2 chunk section** (NW, NE, SW, SE) with specific offset ranges (0‑4 for low, 11‑15 for high), and use specific pairs of low and high to form each corner. A naive brute‑force approach would enumerate all world seeds and, for each, examine many chunk coordinates. Since the structure multipliers depend only on the lower 32 bits (structural potential), the core search space is 2^32 lower‑32 seeds. If one were to test all possible chunk coordinates in a 2^24 × 2^24 chunk grid, the total number of seed‑chunk‑corner evaluations would be 2^24 × 2^24 × 2^32 = 2^80 structure calls (which includes its own 624 MT states per each check). Tackling the problem this way, even with many optimizations, is astronomically impossible.
+We wanted to find seeds that produce a well in a **2×2 chunk section** (NW, NE, SW, SE) with specific offset ranges (0‑4 for low, 11‑15 for high), and use specific pairs of low and high to form each corner. A naive brute‑force approach would enumerate all world seeds and, for each, examine many chunk coordinates. Since the structure multipliers depend only on the lower 32 bits (structural potential), the core search space is 2^32 lower‑32 seeds. If one were to test all possible chunk coordinates in a 2^24 × 2^24 chunk grid, the total number of seed‑chunk‑corner evaluations would be 2^24 × 2^24 × 2^32 = 2^80 structure calls (which includes its own 624 MT states per each check). Tackling the problem this way, even with many optimizations and an extremely strong CPU, is astronomically impossible.
 
 ## Precomputing the Base Seeds
 
@@ -23,7 +23,7 @@ We observed that once the region seed R is computed from the world seed and chun
 
 This **base‑scanning phase** runs only once, producing four lists L_NW, L_NE, L_SW, L_SE of “good” region seeds. The size of each list is far smaller than 2^32 because it requires both the 1/500 chance and the specific offset windows. After this step, the expensive RNG logic is never needed again. The reduction is enormous: we traded the infeasible 2^80 per‑seed chunk evaluations for a single 2^32 scan (which is extremely fast, taking just 30 minutes on typical CPU), and the remaining search space becomes a 2^64 candidate check.
 
-## Algorithm After Precomputation.
+## Algorithm After Precomputation
 
 With the precomputed corner sets, the problem becomes: for each world seed S (lower 32 bits), find a value U = xMul * X + zMul * Z such that four simultaneous inclusions hold:
 
@@ -36,7 +36,7 @@ If we naively scanned all 2^32 possible U for each of the 2^32 seeds, the total 
 
 ## Adding MITM
 
-To make the search feasible, we employed a **Meet‑in‑the‑Middle (MITM)** decomposition on the **low 22 bits** of the region seeds. We only take the lower 22 bits since just taking 22 bits approximately seperates all regions seeds into their own hash cell without taking extra memory. We do MITM and split 22 bits into:
+To make the search feasible, we employ a **Meet‑in‑the‑Middle (MITM)** decomposition on the **low 22 bits** of the region seeds. We only take the lower 22 bits since just taking 22 bits approximately seperates all regions seeds into their own hash cell without taking extra memory. We do MITM and split 22 bits into:
 
 - HIGH_BITS = 12 (4096 possible values)
 - LOW_BITS = 10 (1024 possible values)
@@ -104,7 +104,7 @@ Once a valid seed is confirmed, we still want the actual chunk coordinates (X,Z)
 
     xMul * X + zMul * Z ≡ C  (mod 2^32, signed)
 
-where C = baseSE. We solve it using the extended Euclidean algorithm to find a particular solution. However, many integer solutions exist, and we need the one **closest to the origin**. In Minecraft Bedrock Edition, gameplay physics (player position, collision, movement) uses single‑precision floating point. At large coordinate values (e.g., beyond 2^24 blocks), the precision becomes smaller than the player’s hitbox, causing severe jitter, falling through the world, and loss of control. Thus, only wells nearer the origin are practically visitable. We therefore minimize the **Chebyshev distance** max(|X|,|Z|) via a binary search over the integer solution space, yielding the nearest usable coordinates.
+where C = baseSE. We solve it using the extended Euclidean algorithm to find a particular solution. However, many integer solutions exist, and we need the one **closest to the origin**. In Minecraft Bedrock Edition, gameplay physics (player position, collision, movement) uses single‑precision floating point. At large coordinate values (e.g., beyond 2^24 blocks), the precision points extremely large (e.g, slicing at 0.5 for 2^23, 1.0 for 2^24...), causing severe jitter, falling through the world, and loss of control. Thus, only wells nearer the origin are practically visitable. We therefore minimize the **Chebyshev distance** max(|X|,|Z|) via a binary search over the integer solution space, yielding the nearest usable coordinates.
 
 ## The Full 64‑Bit Seed Extension
 
