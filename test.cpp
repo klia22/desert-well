@@ -129,11 +129,11 @@ inline bool isWell(int64_t worldSeed, int chunkX, int chunkZ) noexcept {
 using namespace std;
 using namespace DW;
 int main() {
-    uint32_t worldSeed = 330963672;
-    uint32_t chunkX = -9062;
-    uint32_t chunkZ = 64098;
-    for(int ax = chunkX - 10; ax <= chunkX + 10; ++ax) {
-        for(int az = chunkZ - 10; az <= chunkZ + 10; ++az) {
+    uint32_t worldSeed = 567715840;
+    uint32_t chunkX = 72;
+    uint32_t chunkZ = -62;
+    for(int ax = chunkX - 1; ax <= chunkX + 1; ++ax) {
+        for(int az = chunkZ - 1; az <= chunkZ + 1; ++az) {
             auto result = findwell(worldSeed, ax, az);
             if(result.hasWell) {
                 cout << "Found well at world coordinates (" << result.worldX << ", " << result.worldZ << ") "<< "Chunk (" << ax << ", " << az << ")\n";
