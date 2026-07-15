@@ -1,4 +1,4 @@
-# Note
+# How to run and use the algorithm
 If you want to run find valid structure seeds, view the releases and then download all the exe and dll files into a single folder to run the .exe file.
 
 Just remember to use the simple cubiomes finder application to convert the raw 32-bit seeds to usable biome matched 64-bit seeds using the 48-bit seed  (48 bits in java include 32 bits in bedrock) method and a biome sampling filter and set the coordinates to the actual block coordinates.
