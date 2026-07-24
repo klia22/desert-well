@@ -1,9 +1,13 @@
 # How to run and use the algorithm
 If you want to run find valid structure seeds, view the releases and then download all the exe and dll files into a single folder to run the .exe file.
 
-Just remember to use the simple cubiomes finder application to convert the raw 32-bit seeds to usable biome matched 64-bit seeds using the 48-bit seed  (48 bits in java include 32 bits in bedrock) method and a biome sampling filter and set the coordinates to the actual block coordinates.
+Just remember to use the simple cubiomes finder application to convert the raw 32-bit seeds to usable biome matched 64-bit seeds using the family block seed method and a biome sampling filter and set the coordinates to the actual block coordinates.
 
 ### How the algorithm works (with the orginal wellfinder.cpp where I got my idea and showed its possible to scan entire seeds on normal CPUs)
+
+## A Simple Explanation (TLDR)
+
+One property that I found with features and structures in bedrock edition were that they and the exact surrounding area is uniquely determined by a repeating rng state that can only have 2^32 states, iterating through these means iterating through the entire world. This means with many optimizations (MITM (meet in the middle) and SIMD (single instruction multiple data) with the help of AI), its possible to scan entire worls with a normal CPU.
 
 ## The Brute‑Force Issue
 
@@ -16,11 +20,11 @@ Minecraft places desert wells with a PRNG call. The process for a given world se
 3. Use R as an RNG seed to draw a PRNG MT call: `nextInt<500>() == 0` (probability 1/500).
 4. If the PRNG MT call succeeds, two more PRNG calls choose an offset inside the 16×16 block, yielding final world coordinates.
 
-We wanted to find seeds that produce a well in a 2×2 chunk section (NW, NE, SW, SE) with specific offset ranges (0‑4 for low, 11‑15 for high), and use specific pairs of low and high to form each corner. A brute‑force approach would enumerate all world seeds and, for each, examine many chunk coordinates. Since the structure multipliers depend only on the lower 32 bits (structural potential), the core search space is 2^32 lower‑32 seeds. If one were to test all possible chunk coordinates in a 2^24 × 2^24 chunk grid, the total number of seed‑chunk‑corner evaluations would be 2^24 × 2^24 × 2^32 = 2^80 structure calls (which includes its own 624 MT states per each check). Tackling the problem this way even with many optimizations and an extremely strong CPU is impossible.
+We wanted to find seeds that produce a well in a 2×2 chunk section (NW, NE, SW, SE) with specific offset ranges (0‑4 for low, 11‑15 for high), and use specific pairs of low and high to form each corner. A brute‑force approach would enumerate all world seeds and, for each, examine many chunk coordinates. Since the structure multipliers depend only on the lower 32 bits (structural potential), the core search space is 2^32 lower‑32 seeds. If we were to test all possible chunk coordinates in a 2^24 × 2^24 chunk grid, the total number of seed‑chunk‑corner evaluations would be 2^24 × 2^24 × 2^32 = 2^80 structure calls (which includes its own 624 MT states per each check). Solving the problem this way even with many optimizations and an extremely strong CPU or GPU is impossible.
 
 ## Precomputing the Base Seeds
 
-We observed that once the region seed R is computed from the world seed and chunk coordinates, all subsequent structure placement decisions – the 1/500 chance and the two offset draws – depend only on R. Since there are only 2^32 values of R, we could replace the per‑seed structure RNG testing with a one‑time precomputation:
+We observed that once the region seed R is computed from the world seed and chunk coordinates, all later structure placement decisions – the 1/500 chance and the two offset draws – depend only on R. Since there are only 2^32 values of R (this is very important, this is the only reason it is possible), we could replace the per‑seed structure RNG testing with a one‑time precomputation:
 
 - We enumerated all 2^32 possible region seeds.
 - For each, we simulated exactly what the game does: the initial structure call (`nextInt<500>() == 0`) and, if successful, the two offset draws.
@@ -41,7 +45,7 @@ If we naively scanned all 2^32 possible U for each of the 2^32 seeds, the total 
 
 ## Adding MITM
 
-To make the search feasible, we employ a Meet‑in‑the‑Middle decomposition on the low 22 bits of the region seeds. We only take the lower 22 bits since just taking 22 bits approximately seperates all regions seeds into their own hash cell without taking extra memory. We do MITM and split 22 bits into:
+To make the search feasible, we employ a Meet‑in‑the‑Middle (MITM) decomposition on the low 22 bits of the region seeds. We only take the lower 22 bits since just taking 22 bits approximately seperates all regions seeds into their own hash cell without taking extra memory. We do MITM and split 22 bits into:
 
 - HIGH_BITS = 12 (4096 possible values)
 - LOW_BITS = 10 (1024 possible values)
