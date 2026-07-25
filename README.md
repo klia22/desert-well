@@ -11,6 +11,8 @@ Just remember to use the simple cubiomes finder application to convert the raw 3
 
 One property that I found with features and structures (yes, it works with structures too, but it is not needed since there's only 2^32 seeds) in bedrock edition were that they and the exact surrounding area is uniquely determined by a repeating rng state that can only have 2^32 states, iterating through these means iterating through the entire world. This means with many optimizations (MITM (meet in the middle) and SIMD (single instruction multiple data) with the help of AI), its possible to scan entire worls with a normal CPU.
 
+# The Full Explanation written by AI (of course its sloppy)
+
 ## The Brute‑Force Issue
 
 Minecraft places desert wells with a PRNG call. The process for a given world seed (64‑bit signed) and chunk coordinates (X,Z) is:
