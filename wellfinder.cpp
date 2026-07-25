@@ -353,7 +353,7 @@ static void buildOffsetSetsFromCache() {
                 uint32_t base = wellBases[i];
                 uint32_t regionSeed = computeRegionSeedFromBase(base);
                 DW::RNG rng(regionSeed);
-                rng.next<500>(); // discard, we know it's 0
+                rng.next<500>(); // we know it's 0, just advance
                 int offZ = rng.next<16>();
                 int offX = rng.next<16>();
                 for(size_t o = 0; o < criteria.size(); ++o){
@@ -640,7 +640,7 @@ static void interactiveTune() {
     }
 }
 
-// ---------- Search phase (randomised thread ranges, resume‑aware) ------------
+// ---------- Search phase -------------------------------------------------------
 static void searchWorker(uint64_t start, uint64_t end, bool testMode,
                          steady_clock::time_point searchStart, Phase& searchStatus) {
     uint64_t localProc=0;
@@ -761,7 +761,7 @@ static void searchWorker(uint64_t start, uint64_t end, bool testMode,
     searchStatus.processed += localProc;
 }
 
-// ---------- Main ----------------------------------------------------------------
+// ---------- Main (with fixed‑block resume) ------------------------------------
 int main() {
     ios::sync_with_stdio(false); cin.tie(nullptr);
     signal(SIGINT, [](int){ stopRequested = true; });
@@ -805,44 +805,67 @@ int main() {
     initMasks();
     buildRowsAndBucket();
 
-    // --- Resume support ---
+    // --- Fixed‑block decomposition for the full 2^32 space ---
     uint64_t totalSeeds = TOTAL_UINT32;
+    unsigned threadCount = thread::hardware_concurrency(); if(threadCount==0) threadCount=1;
+    // Full‑scan block size (used for both fresh and resume)
+    uint64_t fullBlockSize = (totalSeeds + threadCount - 1) / threadCount;
+    fullBlockSize = (fullBlockSize + MITM_LOW_MASK) & ~uint64_t(MITM_LOW_MASK);
+
     uint64_t skipSeeds = 0;
     if (!testMode) {
         cout << "Resume from a previous percentage? (y/n): " << flush;
         char ans; cin >> ans;
         if (ans == 'y' || ans == 'Y') {
             double pct;
-            cout << "Enter percentage to resume from (e.g. 0.24): " << flush;
+            cout << "Enter percentage already scanned (e.g. 3.1): " << flush;
             cin >> pct;
             uint64_t rawSkip = uint64_t(pct * 0.01 * totalSeeds);
-            // round down to nearest multiple of MITM_LOW_SIZE
+            // Align to MITM_LOW_SIZE to avoid mid‑seed issues
             skipSeeds = (rawSkip / MITM_LOW_SIZE) * MITM_LOW_SIZE;
-            cerr << "Will skip " << skipSeeds << " seeds, scanning the remaining "
-                 << (totalSeeds - skipSeeds) << ".\n";
+            cerr << "Resuming from seed " << skipSeeds << " (aligned).\n";
         }
     }
 
-    uint64_t limitTotal = totalSeeds - skipSeeds;
-    unsigned threadCount = thread::hardware_concurrency(); if(threadCount==0) threadCount=1;
-    uint64_t blockSize = (limitTotal + threadCount - 1) / threadCount;
-    blockSize = (blockSize + MITM_LOW_MASK) & ~uint64_t(MITM_LOW_MASK);
+    // Compute block index containing skipSeeds
+    uint64_t blockIndex = skipSeeds / fullBlockSize;   // block that was partially or fully done
+    uint64_t offsetInBlock = skipSeeds % fullBlockSize; // where to start inside that block
 
-    vector<unsigned> perm(threadCount);
-    iota(perm.begin(), perm.end(), 0);
+    // Build list of remaining block indices (blockIndex .. threadCount-1)
+    vector<unsigned> blockIndices;
+    for (unsigned b = blockIndex; b < threadCount; ++b) {
+        blockIndices.push_back(b);
+    }
+    // Shuffle the block indices (except keep the first one at front if we need to start mid‑block)
+    // We'll handle the first block specially if offsetInBlock > 0.
+    // Shuffle all indices; then manually ensure the partial block is processed correctly.
     {
         random_device rd;
         mt19937 rng(rd());
-        shuffle(perm.begin(), perm.end(), rng);
+        shuffle(blockIndices.begin(), blockIndices.end(), rng);
     }
 
-    auto searchStart = steady_clock::now();
-    Phase searchStatus{"search", limitTotal};
-    vector<thread> searchThreads;
+    // Prepare thread ranges
+    vector<pair<uint64_t,uint64_t>> threadRanges(blockIndices.size());
+    for (size_t i = 0; i < blockIndices.size(); ++i) {
+        unsigned b = blockIndices[i];
+        uint64_t blockStart = uint64_t(b) * fullBlockSize;
+        uint64_t blockEnd = min(blockStart + fullBlockSize, totalSeeds);
+        if (b == blockIndex && offsetInBlock > 0) {
+            // This is the partial block where we resume
+            blockStart = skipSeeds;   // start from skipSeeds
+        }
+        threadRanges[i] = {blockStart, blockEnd};
+    }
 
-    for (unsigned i = 0; i < threadCount; ++i) {
-        uint64_t start = skipSeeds + uint64_t(perm[i]) * blockSize;
-        uint64_t end = min(start + blockSize, totalSeeds);
+    uint64_t remaining = totalSeeds - skipSeeds;
+    Phase searchStatus{"search", remaining};
+    vector<thread> searchThreads;
+    auto searchStart = steady_clock::now();
+
+    for (size_t i = 0; i < threadRanges.size(); ++i) {
+        uint64_t start = threadRanges[i].first;
+        uint64_t end = threadRanges[i].second;
         searchThreads.emplace_back([&, start, end]() {
             searchWorker(start, end, testMode, searchStart, searchStatus);
         });
