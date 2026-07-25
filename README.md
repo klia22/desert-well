@@ -62,7 +62,7 @@ The additive terms xMul, zMul, xMul+zMul cause carries from the low‑10 part in
 
     S XOR (U + xMul) ∈ L_SW
 
-If we write U_low = k and U_high = h, then the low‑10 sum k + xMulLow may overflow, adding a 1 bit to the high‑12 part. We handled this by precomputing two carry masks for every possible shift amount (0…1023): a carry‑0 mask that marks the valid column range when no overflow occurs, and a carry‑1 mask for the overflow case.
+If we write U_low = k and U_high = h, then the low‑10 sum k + xMulLow may overflow, adding a 1 bit to the high‑12 part. We can handle this by precomputing two carry masks for every possible shift amount (0…1023): a carry‑0 mask that marks the valid column range when no overflow occurs, and a carry‑1 mask for the overflow case.
 
 For a given k, we computed a 4096‑bit mask of valid high‑12 values for SW by:
 
@@ -82,9 +82,9 @@ The final candidate high‑12 values h for a given k are exactly those bits set 
 
 Only the bits that survive this intersection need further scrutiny.
 
-## SIMD Acceleration
+## SIMD Acceleration (i don't even know, but i used ai to generate this)
 
-All the 4096‑bit mask operations are implemented with AVX2 SIMD intrinsics. A 4096‑bit mask is stored as 16 × 256‑bit registers (`__m256i`). We implemented a bit‑permutation function (`xorPermute1024AVX2`) that reorders the bits within a row according to the low‑10 value of the seed. This permutation uses a series of masked swaps and full‑register permutes (`_mm256_permute4x64_epi64`) to rearrange bits without scalar loops. We pre‑permuted the SE rows once per low‑10 value, reusing them for all seeds sharing that value, further reducing per‑seed work.
+All the 4096‑bit mask operations are implemented with AVX2 SIMD. A 4096‑bit mask is stored as 16 × 256‑bit registers (`__m256i`). We implemented a bit‑permutation function that reorders the bits within a row according to the low‑10 value of the seed. This permutation uses a series of masked swaps and full‑register permutes to rearrange bits without scalar loops. We pre‑permuted the SE rows once per low‑10 value, reusing them for all seeds sharing that value, further reducing per‑seed work.
 
 These SIMD techniques allowed us to process 256 bits per instruction, making the mask intersection loop extremely fast.
 
@@ -96,7 +96,7 @@ When the intersection mask is non‑zero, we store the 4096‑bit result to a lo
 
 Because the MITM filter only uses the low 22 bits, false positives are possible. Therefore we validate every candidate against the full 32‑bit corner sets:
 
-- For SW, NE, NW we use dense bit‑sets) – a single bit test confirms membership in O(1).
+- For SW, NE, NW we use dense bit‑sets – a single bit test confirms membership in 1 single cache operation.
 - For SE we use a compact bucketed index (`seBucketStart`/`seBucketCount`) that stores the full SE values grouped by their low‑22 bits, enabling fast enumeration without a second giant bit‑set.
 
 Only if all four full‑bit checks pass do we count a candidate as a valid solution.
@@ -117,11 +117,11 @@ This entire search only scans the lower 32 bits of the world seed, because the s
 
 We now compiled the final program with the following flags to aggresively optimize for speed:
 
-`-Ofast -march=native -mtune=native -flto -DNDEBUG -pthread`
+`g++ wellfinder.cpp -Ofast -march=native -mtune=native -flto -DNDEBUG -pthread -o wellfinder && ./wellfinder`
 
 ## Summary
 
-We transformed an infeasible 2^80 brute‑force search into a practical ~2^38 scan by:
+We used these strategies:
 
 - Precomputing the region seeds over all 2^32 region seeds, removing the RNG overhead.
 - Using a 12‑high / 10‑low MITM split to reduce per‑seed work from scanning all U to 1024 fast mask intersections.
