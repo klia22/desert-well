@@ -7,7 +7,7 @@ Just remember to use the simple cubiomes finder application to convert the raw 3
 
 ## A Simple Explanation (TLDR)
 
-One property that I found with features and structures in bedrock edition were that they and the exact surrounding area is uniquely determined by a repeating rng state that can only have 2^32 states, iterating through these means iterating through the entire world. This means with many optimizations (MITM (meet in the middle) and SIMD (single instruction multiple data) with the help of AI), its possible to scan entire worls with a normal CPU.
+One property that I found with features and structures (yes, it works with structures too, but it is not needed since there's only 2^32 seeds) in bedrock edition were that they and the exact surrounding area is uniquely determined by a repeating rng state that can only have 2^32 states, iterating through these means iterating through the entire world. This means with many optimizations (MITM (meet in the middle) and SIMD (single instruction multiple data) with the help of AI), its possible to scan entire worls with a normal CPU.
 
 ## The Brute‑Force Issue
 
