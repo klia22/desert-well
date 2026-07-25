@@ -131,3 +131,18 @@ We used these strategies:
 - Solving for the nearest chunk coordinates via Diophantine approximation, respecting Minecraft’s floating‑point limitations.
 
 The result is a system that can scan the entire 2^32 lower‑seed space on a desktop machine (around 5 days on a standard machine, I have not done it yet), making a previously impossible task routine.
+
+## Results
+
+Results for this: (scanned 3% of all seeds)
+ #1 seed=3260148742 xMul=1212464907 zMul=1021291443 originChunk=(-194286,230652) distance=230652
+ Crazy seed 63331873020046342 /tp -3108560 64 3690447 with outpost and 1 block monolith, only problem is 1 is overriden
+ #2 seed=396966923 xMul=183216717 zMul=258171765 originChunk=(676297,-479950) distance=676297
+ #3 seed=935414814 xMul=501859741 zMul=187609529 originChunk=(629207,-1683138) distance=1683138
+ #4 seed=3410719763 xMul=593862825 zMul=60536673 originChunk=(226511,-2222069) distance=2222069
+ #5 seed=2028455956 xMul=733141977 zMul=177467557 originChunk=(-837204,3458590) distance=3458590
+ #6 seed=3375945728 xMul=1559213141 zMul=247948485 originChunk=(618047,-3886555) distance=3886555
+ #7 seed=327506968 xMul=1127681331 zMul=1690897217 originChunk=(4556203,-3038591) distance=4556203
+ #8 seed=672758803 xMul=198009209 zMul=1964168019 originChunk=(-4934470,497448) distance=4934470
+ #9 seed=3528409090 xMul=1147109087 zMul=1731984881 originChunk=(-5059028,3350639) distance=5059028
+ #10 seed=3128943618 xMul=39576601 zMul=31054063 originChunk=(-4848174,6178754) distance=6178754
