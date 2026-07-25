@@ -1,9 +1,5 @@
-// ---------------------------------------------------------------------------
-// Final desert‑well seed finder – universal well cache, interactive tuning,
-// randomised thread ranges, top‑10 tracking, resume support.
 // Compile:
-//   g++ -Ofast -march=native -mtune=native -flto -DNDEBUG -pthread -o finder finder.cpp
-// ---------------------------------------------------------------------------
+//g++ -Ofast -march=native -mtune=native -flto -DNDEBUG -pthread -o wellfinder wellfinder.cpp
 #include <bits/stdc++.h>
 #include <atomic>
 #include <chrono>
