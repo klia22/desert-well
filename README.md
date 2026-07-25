@@ -1,7 +1,7 @@
 # How to run and use the algorithm
 If you want to run find valid structure seeds, view the releases and then download all the exe and dll files into a single folder to run the .exe file.
 
-### Update, curruntly broken, do not try, just g++ compile wellfinder.cpp
+### Update, curruntly broken, do not try, just g++ compile wellfinder.cpp, read release notes for instructions
 
 Just remember to use the simple cubiomes finder application to convert the raw 32-bit seeds to usable biome matched 64-bit seeds using the family block seed method and a biome sampling filter and set the coordinates to the actual block coordinates.
 
