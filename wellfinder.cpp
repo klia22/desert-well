@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // Final desert‑well seed finder – universal well cache, interactive tuning,
-// randomised thread ranges, top‑10 tracking.  (thread‑safe version)
+// randomised thread ranges, top‑10 tracking, resume support.
 // Compile:
 //   g++ -Ofast -march=native -mtune=native -flto -DNDEBUG -pthread -o finder finder.cpp
 // ---------------------------------------------------------------------------
@@ -271,9 +271,8 @@ static bool offsetInCriteria(int offX,int offZ,const OffsetCriteria& crit){
 }
 
 // ---------- Universal well base cache ------------------------------------------
-static vector<uint32_t> wellBases;   // all region seeds that have a well (any offset)
+static vector<uint32_t> wellBases;
 
-// Scan all 2^32 bases and save those with a well to a file.
 static void generateWellBases(const string& filename) {
     uint64_t limit = TOTAL_UINT32;
     unsigned threadCount = thread::hardware_concurrency(); if(threadCount==0)threadCount=1;
@@ -302,7 +301,6 @@ static void generateWellBases(const string& filename) {
 
     vector<thread> threads;
     for(unsigned t=0;t<threadCount;++t) threads.emplace_back(worker,t);
-    // Simple progress reporter
     thread rep([&](){
         while(processed.load() < limit && !stopRequested){
             this_thread::sleep_for(seconds(5));
@@ -311,14 +309,12 @@ static void generateWellBases(const string& filename) {
         }
     });
     for(auto& t:threads) t.join();
-    stopRequested = true; // signal reporter
+    stopRequested = true;
     rep.join();
 
-    // Sort and deduplicate (should already be unique)
     sort(wellBases.begin(), wellBases.end());
     wellBases.erase(unique(wellBases.begin(), wellBases.end()), wellBases.end());
 
-    // Save to file
     ofstream ofs(filename, ios::binary);
     uint64_t count = wellBases.size();
     ofs.write(reinterpret_cast<const char*>(&count), sizeof(count));
@@ -326,7 +322,6 @@ static void generateWellBases(const string& filename) {
     cerr << "Saved " << count << " well bases to " << filename << "\n";
 }
 
-// Load the universal well base file.
 static bool loadWellBases(const string& filename) {
     ifstream ifs(filename, ios::binary);
     if(!ifs) return false;
@@ -342,7 +337,6 @@ static bool loadWellBases(const string& filename) {
     return true;
 }
 
-// Build per‑offset base sets using the loaded universal well bases (thread‑safe).
 static void buildOffsetSetsFromCache() {
     for(auto& s : baseSets) s.clear();
 
@@ -350,11 +344,10 @@ static void buildOffsetSetsFromCache() {
     size_t total = wellBases.size();
     size_t block = (total + threadCount - 1) / threadCount;
 
-    // Each thread gets its own per‑offset vectors to avoid races.
-    vector<thread> threads;
     vector<vector<vector<uint32_t>>> threadLocalSets(threadCount,
         vector<vector<uint32_t>>(chunkOffsets.size()));
 
+    vector<thread> threads;
     for(unsigned t=0; t<threadCount; ++t){
         size_t start = t * block;
         size_t end = min(start + block, total);
@@ -364,7 +357,7 @@ static void buildOffsetSetsFromCache() {
                 uint32_t base = wellBases[i];
                 uint32_t regionSeed = computeRegionSeedFromBase(base);
                 DW::RNG rng(regionSeed);
-                rng.next<500>(); // we know it's 0, just advance
+                rng.next<500>(); // discard, we know it's 0
                 int offZ = rng.next<16>();
                 int offX = rng.next<16>();
                 for(size_t o = 0; o < criteria.size(); ++o){
@@ -377,7 +370,6 @@ static void buildOffsetSetsFromCache() {
     }
     for(auto& t: threads) t.join();
 
-    // Merge all thread‑local sets into global baseSets
     for(size_t o = 0; o < criteria.size(); ++o){
         for(unsigned t = 0; t < threadCount; ++t){
             auto& part = threadLocalSets[t][o];
@@ -628,7 +620,6 @@ static void interactiveTune() {
                                         uint32_t targetBase = seed ^ uint32_t(U + uint32_t(Dv));
                                         if (!binary_search(baseSets[o].begin(), baseSets[o].end(), targetBase)) { ok = false; break; }
                                     }
-                                    // verification done
                                 }
                             }
                         }
@@ -653,7 +644,7 @@ static void interactiveTune() {
     }
 }
 
-// ---------- Search phase (randomised thread ranges) ---------------------------
+// ---------- Search phase (randomised thread ranges, resume‑aware) ------------
 static void searchWorker(uint64_t start, uint64_t end, bool testMode,
                          steady_clock::time_point searchStart, Phase& searchStatus) {
     uint64_t localProc=0;
@@ -798,12 +789,10 @@ int main() {
                 return 1;
             }
         } else {
-            // Test mode: require cache, but we can fall back to a 10‑second scan?
             cerr << "Test mode requires the well cache; please generate it first in normal mode.\n";
             return 1;
         }
     }
-    // Build per‑offset sets from cache
     buildOffsetSetsFromCache();
 
     if (testMode && stopRequested) cerr << "Base scan time limit reached.\n";
@@ -820,7 +809,25 @@ int main() {
     initMasks();
     buildRowsAndBucket();
 
-    uint64_t limitTotal = 1ull << 32;
+    // --- Resume support ---
+    uint64_t totalSeeds = TOTAL_UINT32;
+    uint64_t skipSeeds = 0;
+    if (!testMode) {
+        cout << "Resume from a previous percentage? (y/n): " << flush;
+        char ans; cin >> ans;
+        if (ans == 'y' || ans == 'Y') {
+            double pct;
+            cout << "Enter percentage to resume from (e.g. 0.24): " << flush;
+            cin >> pct;
+            uint64_t rawSkip = uint64_t(pct * 0.01 * totalSeeds);
+            // round down to nearest multiple of MITM_LOW_SIZE
+            skipSeeds = (rawSkip / MITM_LOW_SIZE) * MITM_LOW_SIZE;
+            cerr << "Will skip " << skipSeeds << " seeds, scanning the remaining "
+                 << (totalSeeds - skipSeeds) << ".\n";
+        }
+    }
+
+    uint64_t limitTotal = totalSeeds - skipSeeds;
     unsigned threadCount = thread::hardware_concurrency(); if(threadCount==0) threadCount=1;
     uint64_t blockSize = (limitTotal + threadCount - 1) / threadCount;
     blockSize = (blockSize + MITM_LOW_MASK) & ~uint64_t(MITM_LOW_MASK);
@@ -838,8 +845,8 @@ int main() {
     vector<thread> searchThreads;
 
     for (unsigned i = 0; i < threadCount; ++i) {
-        uint64_t start = uint64_t(perm[i]) * blockSize;
-        uint64_t end = min(start + blockSize, limitTotal);
+        uint64_t start = skipSeeds + uint64_t(perm[i]) * blockSize;
+        uint64_t end = min(start + blockSize, totalSeeds);
         searchThreads.emplace_back([&, start, end]() {
             searchWorker(start, end, testMode, searchStart, searchStatus);
         });
