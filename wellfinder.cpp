@@ -241,7 +241,8 @@ static BestSol nearest(uint32_t seed,uint32_t xMul,uint32_t zMul,uint32_t combin
 struct OffsetCriteria { vector<pair<int,int>> rangesX, rangesZ; };
 static vector<pair<int,int>> chunkOffsets;
 static vector<OffsetCriteria> criteria;
-static vector<vector<uint32_t>> baseSets;   // index 0 = (0,0)
+static vector<vector<uint32_t>> baseSets;         // index 0 = (0,0)
+static vector<uint32_t> baseSetsSplit[2];        // two halves of anchor (FIXED TYPE)
 
 static void readFormation() {
     cout << "Enter number of chunk offsets: " << flush; int n; cin >> n;
@@ -335,6 +336,8 @@ static bool loadWellBases(const string& filename) {
 
 static void buildOffsetSetsFromCache() {
     for(auto& s : baseSets) s.clear();
+    baseSetsSplit[0].clear();
+    baseSetsSplit[1].clear();
 
     unsigned threadCount = thread::hardware_concurrency(); if(threadCount==0)threadCount=1;
     size_t total = wellBases.size();
@@ -374,9 +377,114 @@ static void buildOffsetSetsFromCache() {
         sort(baseSets[o].begin(), baseSets[o].end());
         baseSets[o].erase(unique(baseSets[o].begin(), baseSets[o].end()), baseSets[o].end());
     }
-    cerr << "Base sets built from cache. Set sizes:";
+
+    // Split anchor set (index 0) into two halves by lowest bit
+    const auto& fullAnchor = baseSets[0];
+    for (uint32_t v : fullAnchor) {
+        if (v & 1u) baseSetsSplit[1].push_back(v);
+        else        baseSetsSplit[0].push_back(v);
+    }
+    cerr << "Base sets built from cache. Full sizes:";
     for(auto& s : baseSets) cerr << ' ' << s.size();
-    cerr << '\n';
+    cerr << " | Split anchor sizes: " << baseSetsSplit[0].size() << " " << baseSetsSplit[1].size() << '\n';
+}
+
+// ---------- Row tables & anchor buckets (full & split) ------------------------
+static vector<vector<RM1024>> baseRows;          // for full anchor
+static vector<uint32_t> anchorValuesFlat;
+static vector<uint32_t> anchorBucketStart;
+static vector<uint32_t> anchorBucketCount;
+
+static vector<vector<RM1024>> baseRowsSplit[2];  // for each half
+static vector<uint32_t> anchorValuesFlatSplit[2];
+static vector<uint32_t> anchorBucketStartSplit[2];
+static vector<uint32_t> anchorBucketCountSplit[2];
+
+static vector<vector<RM1024>> otherRows;         // rows for offsets 1.. (shared)
+
+static void initMasks() {
+    cm0.resize(MITM_LOW_SIZE);
+    cm1.resize(MITM_LOW_SIZE);
+    avxMask0.resize(MITM_LOW_SIZE);
+    avxMask1.resize(MITM_LOW_SIZE);
+    for (uint32_t d = 0; d < MITM_LOW_SIZE; ++d) {
+        cm0[d] = RM1024{};
+        uint32_t bits = MITM_LOW_SIZE - d;
+        uint32_t fullWords = bits / 64, rem = bits % 64;
+        for (uint32_t i = 0; i < fullWords; ++i) cm0[d].w[i] = ~0ull;
+        if (rem && fullWords < 16) cm0[d].w[fullWords] = (1ull << rem) - 1ull;
+        for (int i = 0; i < 16; ++i) cm1[d].w[i] = ~cm0[d].w[i];
+
+        avxMask0[d].v[0] = _mm256_loadu_si256((__m256i*)&cm0[d].w[0]);
+        avxMask0[d].v[1] = _mm256_loadu_si256((__m256i*)&cm0[d].w[4]);
+        avxMask0[d].v[2] = _mm256_loadu_si256((__m256i*)&cm0[d].w[8]);
+        avxMask0[d].v[3] = _mm256_loadu_si256((__m256i*)&cm0[d].w[12]);
+        avxMask1[d].v[0] = _mm256_loadu_si256((__m256i*)&cm1[d].w[0]);
+        avxMask1[d].v[1] = _mm256_loadu_si256((__m256i*)&cm1[d].w[4]);
+        avxMask1[d].v[2] = _mm256_loadu_si256((__m256i*)&cm1[d].w[8]);
+        avxMask1[d].v[3] = _mm256_loadu_si256((__m256i*)&cm1[d].w[12]);
+    }
+}
+
+static void buildRowsAndBucket(bool splitMode) {
+    // Build rows for offsets 1.. (shared) – they are always the full sets.
+    otherRows.clear();
+    for (size_t i = 1; i < baseSets.size(); ++i) {
+        otherRows.push_back(vector<RM1024>(MITM_HIGH_SIZE, RM1024{}));
+        for (uint32_t v : baseSets[i]) {
+            uint32_t low = v & LOWER_MASK, row = low >> MITM_LOW_BITS, col = low & MITM_LOW_MASK;
+            otherRows.back()[row].w[col >> 6] |= 1ULL << (col & 63);
+        }
+    }
+
+    if (!splitMode) {
+        // Full anchor
+        baseRows.resize(1);
+        baseRows[0].assign(MITM_HIGH_SIZE, RM1024{});
+        for (uint32_t v : baseSets[0]) {
+            uint32_t low = v & LOWER_MASK, row = low >> MITM_LOW_BITS, col = low & MITM_LOW_MASK;
+            baseRows[0][row].w[col >> 6] |= 1ULL << (col & 63);
+        }
+        anchorValuesFlat = baseSets[0];
+        sort(anchorValuesFlat.begin(), anchorValuesFlat.end(), [](uint32_t a, uint32_t b) {
+            uint32_t la = a & LOWER_MASK, lb = b & LOWER_MASK; return la < lb ? true : (la == lb && a < b);
+        });
+        anchorBucketStart.assign(LOWER_SIZE, 0);
+        anchorBucketCount.assign(LOWER_SIZE, 0);
+        for (size_t i = 0; i < anchorValuesFlat.size(); ) {
+            uint32_t low = anchorValuesFlat[i] & LOWER_MASK;
+            size_t j = i;
+            while (j < anchorValuesFlat.size() && (anchorValuesFlat[j] & LOWER_MASK) == low) ++j;
+            anchorBucketStart[low] = uint32_t(i);
+            anchorBucketCount[low] = uint32_t(j - i);
+            i = j;
+        }
+    } else {
+        // Split mode: two anchor halves
+        for (int h = 0; h < 2; ++h) {
+            baseRowsSplit[h].resize(1);
+            baseRowsSplit[h][0].assign(MITM_HIGH_SIZE, RM1024{});
+            for (uint32_t v : baseSetsSplit[h]) {      // baseSetsSplit[h] is vector<uint32_t>
+                uint32_t low = v & LOWER_MASK, row = low >> MITM_LOW_BITS, col = low & MITM_LOW_MASK;
+                baseRowsSplit[h][0][row].w[col >> 6] |= 1ULL << (col & 63);
+            }
+            anchorValuesFlatSplit[h] = baseSetsSplit[h];
+            sort(anchorValuesFlatSplit[h].begin(), anchorValuesFlatSplit[h].end(),
+                 [](uint32_t a, uint32_t b) {
+                     uint32_t la = a & LOWER_MASK, lb = b & LOWER_MASK; return la < lb ? true : (la == lb && a < b);
+                 });
+            anchorBucketStartSplit[h].assign(LOWER_SIZE, 0);
+            anchorBucketCountSplit[h].assign(LOWER_SIZE, 0);
+            for (size_t i = 0; i < anchorValuesFlatSplit[h].size(); ) {
+                uint32_t low = anchorValuesFlatSplit[h][i] & LOWER_MASK;
+                size_t j = i;
+                while (j < anchorValuesFlatSplit[h].size() && (anchorValuesFlatSplit[h][j] & LOWER_MASK) == low) ++j;
+                anchorBucketStartSplit[h][low] = uint32_t(i);
+                anchorBucketCountSplit[h][low] = uint32_t(j - i);
+                i = j;
+            }
+        }
+    }
 }
 
 // ---------- Top‑10 solution tracking & file output -----------------------------
@@ -442,67 +550,183 @@ static void reporter(const Phase& status) {
     printProgress(status.name, status.processed, status.total, 0);
 }
 
-// ---------- Row tables & anchor bucket (parameterised) --------------------------
-static vector<vector<RM1024>> baseRows;
-static vector<uint32_t> anchorValuesFlat;
-static vector<uint32_t> anchorBucketStart;
-static vector<uint32_t> anchorBucketCount;
+// ---------- Search core (used by both full and split modes) --------------------
+static void searchOneSeed(uint32_t seed, uint32_t xMul, uint32_t zMul,
+                          const vector<vector<RM1024>>& permRowsAnchor,   // anchor rows (size 1)
+                          const vector<vector<RM1024>>& permOtherRows,   // rows for offsets 1..
+                          const vector<uint32_t>& anchorStart, const vector<uint32_t>& anchorCount,
+                          const vector<uint32_t>& anchorValues) {
+    uint32_t seedLow = seed & LOWER_MASK;
+    uint32_t seedHigh12 = (seedLow >> MITM_LOW_BITS) & MITM_HIGH_MASK;
 
-static void initMasks() {
-    cm0.resize(MITM_LOW_SIZE);
-    cm1.resize(MITM_LOW_SIZE);
-    avxMask0.resize(MITM_LOW_SIZE);
-    avxMask1.resize(MITM_LOW_SIZE);
-    for (uint32_t d = 0; d < MITM_LOW_SIZE; ++d) {
-        cm0[d] = RM1024{};
-        uint32_t bits = MITM_LOW_SIZE - d;
-        uint32_t fullWords = bits / 64, rem = bits % 64;
-        for (uint32_t i = 0; i < fullWords; ++i) cm0[d].w[i] = ~0ull;
-        if (rem && fullWords < 16) cm0[d].w[fullWords] = (1ull << rem) - 1ull;
-        for (int i = 0; i < 16; ++i) cm1[d].w[i] = ~cm0[d].w[i];
+    for (uint32_t row0 = 0; row0 < MITM_HIGH_SIZE; ++row0) {
+        M1024 mask;
+        mask.v[0] = _mm256_loadu_si256((__m256i*)&permRowsAnchor[0][row0].w[0]);
+        mask.v[1] = _mm256_loadu_si256((__m256i*)&permRowsAnchor[0][row0].w[4]);
+        mask.v[2] = _mm256_loadu_si256((__m256i*)&permRowsAnchor[0][row0].w[8]);
+        mask.v[3] = _mm256_loadu_si256((__m256i*)&permRowsAnchor[0][row0].w[12]);
+        bool skip = false;
 
-        avxMask0[d].v[0] = _mm256_loadu_si256((__m256i*)&cm0[d].w[0]);
-        avxMask0[d].v[1] = _mm256_loadu_si256((__m256i*)&cm0[d].w[4]);
-        avxMask0[d].v[2] = _mm256_loadu_si256((__m256i*)&cm0[d].w[8]);
-        avxMask0[d].v[3] = _mm256_loadu_si256((__m256i*)&cm0[d].w[12]);
-        avxMask1[d].v[0] = _mm256_loadu_si256((__m256i*)&cm1[d].w[0]);
-        avxMask1[d].v[1] = _mm256_loadu_si256((__m256i*)&cm1[d].w[4]);
-        avxMask1[d].v[2] = _mm256_loadu_si256((__m256i*)&cm1[d].w[8]);
-        avxMask1[d].v[3] = _mm256_loadu_si256((__m256i*)&cm1[d].w[12]);
-    }
-}
+        for (size_t o = 0; o < permOtherRows.size(); ++o) {   // offsets 1..
+            int64_t D = int64_t(chunkOffsets[o+1].first) * xMul + int64_t(chunkOffsets[o+1].second) * zMul;
+            uint32_t Dlow = uint32_t(D) & LOWER_MASK;
+            uint32_t dLow10 = Dlow & MITM_LOW_MASK;
+            uint32_t dHigh12 = (Dlow >> MITM_LOW_BITS) & MITM_HIGH_MASK;
+            uint32_t uHigh12 = seedHigh12 ^ row0;
+            uint32_t sumHigh = (uHigh12 + dHigh12) & MITM_HIGH_MASK;
+            uint32_t targetRow = seedHigh12 ^ sumHigh;
 
-static void buildRowsAndBucket(){
-    baseRows.resize(baseSets.size());
-    for(size_t i=0;i<baseSets.size();++i){
-        baseRows[i].assign(MITM_HIGH_SIZE, RM1024{});
-        for(uint32_t v:baseSets[i]){
-            uint32_t low=v & LOWER_MASK, row=low>>MITM_LOW_BITS, col=low & MITM_LOW_MASK;
-            baseRows[i][row].w[col>>6] |= 1ULL<<(col&63);
+            auto getShift = [](unsigned r, uint32_t lowMask) -> tuple<unsigned,unsigned,unsigned> {
+                r &= lowMask; return { r>>6, r&63u, 64u-(r&63u) };
+            };
+            auto [wordShift, bitShift, bitShift2] = getShift(dLow10, MITM_LOW_MASK);
+            bool doShift = (bitShift != 0);
+            __m128i shiftR = _mm_cvtsi32_si128(bitShift), shiftL = _mm_cvtsi32_si128(bitShift2);
+
+            M1024 extra;
+            extra.loadRot(permOtherRows[o][targetRow].w, wordShift, shiftR, shiftL, doShift);
+            extra.bitAnd(avxMask0[dLow10]);
+            if (dLow10 != 0u) {
+                uint32_t targetRow1 = seedHigh12 ^ ((sumHigh+1u) & MITM_HIGH_MASK);
+                M1024 extra1;
+                extra1.loadRot(permOtherRows[o][targetRow1].w, wordShift, shiftR, shiftL, doShift);
+                extra1.bitAnd(avxMask1[dLow10]);
+                extra.bitOr(extra1);
+            }
+            mask.bitAnd(extra);
+            if (!mask.any()) { skip = true; break; }
+        }
+        if (skip) continue;
+
+        alignas(32) uint64_t mw[16];
+        _mm256_storeu_si256((__m256i*)&mw[0], mask.v[0]);
+        _mm256_storeu_si256((__m256i*)&mw[4], mask.v[1]);
+        _mm256_storeu_si256((__m256i*)&mw[8], mask.v[2]);
+        _mm256_storeu_si256((__m256i*)&mw[12], mask.v[3]);
+
+        for (int w = 0; w < 16; ++w) {
+            uint64_t bits = mw[w];
+            while (bits) {
+                unsigned bit = unsigned(__builtin_ctzll(bits)); bits &= bits-1;
+                uint32_t uLow10 = uint32_t(w*64 + bit);
+                uint32_t uHigh12 = seedHigh12 ^ row0;
+                uint32_t lowVal = seedLow ^ ((uHigh12 << MITM_LOW_BITS) | uLow10);
+
+                uint32_t startIdx = anchorStart[lowVal];
+                uint32_t cnt = anchorCount[lowVal];
+                for (uint32_t k = 0; k < cnt; ++k) {
+                    uint32_t base0 = anchorValues[startIdx + k];
+                    uint32_t U = seed ^ base0;
+                    bool ok = true;
+                    for (size_t o = 1; o < baseSets.size(); ++o) {
+                        int64_t Dv = int64_t(chunkOffsets[o].first)*xMul + int64_t(chunkOffsets[o].second)*zMul;
+                        uint32_t targetBase = seed ^ uint32_t(U + uint32_t(Dv));
+                        if (!binary_search(baseSets[o].begin(), baseSets[o].end(), targetBase)) { ok = false; break; }
+                    }
+                    if (!ok) continue;
+
+                    BestSol sol = nearest(seed, xMul, zMul, U);
+                    if (sol.distance == UINT64_MAX) continue;
+
+                    if (!DW::isWell(int64_t(seed), sol.chunkX, sol.chunkZ)) continue;
+                    bool allWells = true;
+                    for (size_t o = 1; o < chunkOffsets.size(); ++o) {
+                        int testX = sol.chunkX + chunkOffsets[o].first;
+                        int testZ = sol.chunkZ + chunkOffsets[o].second;
+                        if (!DW::isWell(int64_t(seed), testX, testZ)) { allWells = false; break; }
+                    }
+                    if (!allWells) continue;
+
+                    candidateCount.fetch_add(1); foundCount.fetch_add(1);
+                    addSolution(sol);
+                }
+            }
         }
     }
-    const auto& set0 = baseSets[0];
-    anchorValuesFlat = set0;
-    sort(anchorValuesFlat.begin(), anchorValuesFlat.end(), [](uint32_t a,uint32_t b){
-        uint32_t la=a&LOWER_MASK, lb=b&LOWER_MASK; if(la!=lb)return la<lb; return a<b;
-    });
-    anchorBucketStart.assign(LOWER_SIZE, 0);
-    anchorBucketCount.assign(LOWER_SIZE, 0);
-    for(size_t i=0;i<anchorValuesFlat.size();){
-        uint32_t low = anchorValuesFlat[i]&LOWER_MASK; size_t j=i;
-        while(j<anchorValuesFlat.size() && (anchorValuesFlat[j]&LOWER_MASK)==low) ++j;
-        anchorBucketStart[low] = uint32_t(i);
-        anchorBucketCount[low] = uint32_t(j-i);
-        i=j;
-    }
 }
 
-// ---------- Interactive tuning -----------------------------------------------
+// ---------- Search worker (full or split) --------------------------------------
+static void searchWorker(uint64_t start, uint64_t end, bool testMode,
+                         steady_clock::time_point searchStart, Phase& searchStatus,
+                         bool splitMode) {
+    uint64_t localProc = 0;
+    // Pre‑permuted rows for other offsets (shared)
+    vector<vector<RM1024>> permOtherRows(otherRows.size());
+    for (size_t o = 0; o < otherRows.size(); ++o) permOtherRows[o].resize(MITM_HIGH_SIZE);
+
+    // Anchor rows (full or split)
+    vector<vector<RM1024>> permAnchorRows[2];
+    if (splitMode) {
+        permAnchorRows[0].resize(1, vector<RM1024>(MITM_HIGH_SIZE));
+        permAnchorRows[1].resize(1, vector<RM1024>(MITM_HIGH_SIZE));
+    } else {
+        permAnchorRows[0].resize(1, vector<RM1024>(MITM_HIGH_SIZE));
+    }
+
+    for (uint32_t sl10 = 0; sl10 < MITM_LOW_SIZE; ++sl10) {
+        if (stopRequested) break;
+        if (testMode && duration<double>(steady_clock::now()-searchStart).count() >= 10.0) {
+            stopRequested = true; break;
+        }
+
+        // Permute other rows (same for both modes)
+        for (size_t o = 0; o < otherRows.size(); ++o) {
+            for (uint32_t r = 0; r < MITM_HIGH_SIZE; ++r) {
+                permOtherRows[o][r] = otherRows[o][r];
+                xorPerm(permOtherRows[o][r], sl10);
+            }
+        }
+
+        if (!splitMode) {
+            auto& anch = permAnchorRows[0][0];
+            for (uint32_t r = 0; r < MITM_HIGH_SIZE; ++r) {
+                anch[r] = baseRows[0][r];
+                xorPerm(anch[r], sl10);
+            }
+        } else {
+            for (int h = 0; h < 2; ++h) {
+                auto& anch = permAnchorRows[h][0];
+                for (uint32_t r = 0; r < MITM_HIGH_SIZE; ++r) {
+                    anch[r] = baseRowsSplit[h][0][r];
+                    xorPerm(anch[r], sl10);
+                }
+            }
+        }
+
+        for (uint64_t base = start; base < end; base += MITM_LOW_SIZE) {
+            if (stopRequested) break;
+            uint64_t curSeedVal = base + sl10;
+            if (curSeedVal >= end) continue;
+            uint32_t seed = uint32_t(curSeedVal);
+            auto feat = MakeFeatureSeed(seed);
+            uint32_t xMul = feat.xMul, zMul = feat.zMul;
+
+            if (!splitMode) {
+                searchOneSeed(seed, xMul, zMul, permAnchorRows[0], permOtherRows,
+                              anchorBucketStart, anchorBucketCount, anchorValuesFlat);
+            } else {
+                for (int h = 0; h < 2; ++h) {
+                    searchOneSeed(seed, xMul, zMul, permAnchorRows[h], permOtherRows,
+                                  anchorBucketStartSplit[h], anchorBucketCountSplit[h],
+                                  anchorValuesFlatSplit[h]);
+                }
+            }
+
+            ++localProc;
+            if ((localProc & (FLUSH_INTERVAL-1)) == 0) {
+                searchStatus.processed += localProc;
+                localProc = 0;
+            }
+        }
+    }
+    searchStatus.processed += localProc;
+}
+
+// ---------- Interactive tuning (supports both full and split) ------------------
 static void interactiveTune() {
-    cout << "Interactive tuning: enter HIGH_BITS LOW_BITS [TIME_LIMIT] to benchmark.\n";
+    cout << "Interactive tuning: enter HIGH_BITS LOW_BITS [TIME_LIMIT] to benchmark full mode.\n";
+    cout << "Prefix with 'split' for split‑base mode (e.g. split 15 10 1).\n";
     cout << "Constraints: HIGH_BITS >= 1, 1 <= LOW_BITS <= 10, total (HIGH+LOW) <= 26.\n";
-    cout << "  (e.g. 18 6 2  → test 18 high + 6 low for 2 seconds)\n";
-    cout << "  Enter just HIGH_BITS LOW_BITS to finalise and start search.\n";
     random_device rd;
     mt19937 rng(rd());
     uniform_int_distribution<uint32_t> seedDist(0, UINT32_MAX);
@@ -512,253 +736,96 @@ static void interactiveTune() {
         string line; getline(cin, line);
         if (line.empty()) continue;
         istringstream iss(line);
+        string cmd;
+        iss >> cmd;
+        bool splitMode = false;
         uint32_t hb, lb; double tlim = -1.0;
-        if (iss >> hb >> lb) {
-            if (hb < 1 || lb < 1 || lb > 10) {
-                cerr << "Invalid: LOW_BITS must be between 1 and 10.\n";
-                continue;
-            }
-            uint32_t totalBits = hb + lb;
-            if (totalBits > 26) {
-                cerr << "Invalid: total bits (high+low) must be ≤ 26 to keep memory usage manageable.\n";
-                continue;
-            }
-            if (iss >> tlim) {
-                if (tlim <= 0.0) { cerr << "Time limit must be positive.\n"; continue; }
-                LOWER_BITS = totalBits;
-                MITM_HIGH_BITS = hb; MITM_LOW_BITS = lb;
-                MITM_HIGH_SIZE = 1 << hb; MITM_HIGH_MASK = MITM_HIGH_SIZE - 1;
-                MITM_LOW_SIZE = 1 << lb; MITM_LOW_MASK = MITM_LOW_SIZE - 1;
-                LOWER_SIZE = 1 << LOWER_BITS; LOWER_MASK = LOWER_SIZE - 1;
-                initMasks();
-                buildRowsAndBucket();
-
-                atomic<bool> timeUp{false};
-                thread timer([&](){ this_thread::sleep_for(duration<double>(tlim)); timeUp = true; });
-
-                uint64_t seedsDone = 0;
-                auto benchStart = steady_clock::now();
-                while (!timeUp) {
-                    uint32_t seed = seedDist(rng);
-                    auto feat = MakeFeatureSeed(seed);
-                    uint32_t xMul = feat.xMul, zMul = feat.zMul;
-                    uint32_t seedLow = seed & LOWER_MASK;
-                    uint32_t sl10 = seedLow & MITM_LOW_MASK;
-                    uint32_t seedHigh12 = (seedLow >> MITM_LOW_BITS) & MITM_HIGH_MASK;
-
-                    vector<vector<RM1024>> permRows(baseSets.size());
-                    for (size_t o = 0; o < baseSets.size(); ++o) {
-                        permRows[o].resize(MITM_HIGH_SIZE);
-                        for (uint32_t r = 0; r < MITM_HIGH_SIZE; ++r) {
-                            permRows[o][r] = baseRows[o][r];
-                            xorPerm(permRows[o][r], sl10);
-                        }
-                    }
-
-                    for (uint32_t row0 = 0; row0 < MITM_HIGH_SIZE && !timeUp; ++row0) {
-                        M1024 mask;
-                        mask.v[0] = _mm256_loadu_si256((__m256i*)&permRows[0][row0].w[0]);
-                        mask.v[1] = _mm256_loadu_si256((__m256i*)&permRows[0][row0].w[4]);
-                        mask.v[2] = _mm256_loadu_si256((__m256i*)&permRows[0][row0].w[8]);
-                        mask.v[3] = _mm256_loadu_si256((__m256i*)&permRows[0][row0].w[12]);
-                        bool skip = false;
-                        for (size_t o = 1; o < baseSets.size(); ++o) {
-                            int64_t D = int64_t(chunkOffsets[o].first)*xMul + int64_t(chunkOffsets[o].second)*zMul;
-                            uint32_t Dlow = uint32_t(D) & LOWER_MASK;
-                            uint32_t dLow10 = Dlow & MITM_LOW_MASK;
-                            uint32_t dHigh12 = (Dlow >> MITM_LOW_BITS) & MITM_HIGH_MASK;
-                            uint32_t uHigh12 = seedHigh12 ^ row0;
-                            uint32_t sumHigh = (uHigh12 + dHigh12) & MITM_HIGH_MASK;
-                            uint32_t targetRow = seedHigh12 ^ sumHigh;
-
-                            auto getShift = [](unsigned r, uint32_t lowMask)->tuple<unsigned,unsigned,unsigned>{
-                                r &= lowMask; return { r>>6, r&63u, 64u-(r&63u) };
-                            };
-                            auto [wordShift, bitShift, bitShift2] = getShift(dLow10, MITM_LOW_MASK);
-                            bool doShift = (bitShift != 0);
-                            __m128i shiftR = _mm_cvtsi32_si128(bitShift), shiftL = _mm_cvtsi32_si128(bitShift2);
-                            M1024 extra;
-                            extra.loadRot(permRows[o][targetRow].w, wordShift, shiftR, shiftL, doShift);
-                            extra.bitAnd(avxMask0[dLow10]);
-                            if (dLow10 != 0u) {
-                                uint32_t targetRow1 = seedHigh12 ^ ((sumHigh+1u)&MITM_HIGH_MASK);
-                                M1024 extra1;
-                                extra1.loadRot(permRows[o][targetRow1].w, wordShift, shiftR, shiftL, doShift);
-                                extra1.bitAnd(avxMask1[dLow10]);
-                                extra.bitOr(extra1);
-                            }
-                            mask.bitAnd(extra);
-                            if (!mask.any()) { skip = true; break; }
-                        }
-                        if (skip) continue;
-
-                        alignas(32) uint64_t mw[16];
-                        _mm256_storeu_si256((__m256i*)&mw[0], mask.v[0]);
-                        _mm256_storeu_si256((__m256i*)&mw[4], mask.v[1]);
-                        _mm256_storeu_si256((__m256i*)&mw[8], mask.v[2]);
-                        _mm256_storeu_si256((__m256i*)&mw[12], mask.v[3]);
-                        for (int w = 0; w < 16 && !timeUp; ++w) {
-                            uint64_t bits = mw[w];
-                            while (bits && !timeUp) {
-                                unsigned bit = unsigned(__builtin_ctzll(bits)); bits &= bits-1;
-                                uint32_t uLow10 = uint32_t(w*64 + bit);
-                                uint32_t uHigh12 = seedHigh12 ^ row0;
-                                uint32_t lowVal = seedLow ^ ((uHigh12<<MITM_LOW_BITS) | uLow10);
-
-                                uint32_t startIdx = anchorBucketStart[lowVal];
-                                uint32_t cnt = anchorBucketCount[lowVal];
-                                for (uint32_t k = 0; k < cnt && !timeUp; ++k) {
-                                    uint32_t base0 = anchorValuesFlat[startIdx + k];
-                                    uint32_t U = seed ^ base0;
-                                    bool ok = true;
-                                    for (size_t o = 1; o < baseSets.size(); ++o) {
-                                        int64_t Dv = int64_t(chunkOffsets[o].first)*xMul + int64_t(chunkOffsets[o].second)*zMul;
-                                        uint32_t targetBase = seed ^ uint32_t(U + uint32_t(Dv));
-                                        if (!binary_search(baseSets[o].begin(), baseSets[o].end(), targetBase)) { ok = false; break; }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    ++seedsDone;
-                }
-                timer.join();
-                auto benchEnd = steady_clock::now();
-                double elapsed = duration<double>(benchEnd - benchStart).count();
-                if (seedsDone == 0) cout << "No seeds processed.\n";
-                else cout << seedsDone << " seeds in " << elapsed << " s (" << (elapsed*1e6/seedsDone) << " µs/seed)\n";
-            } else {
-                LOWER_BITS = totalBits;
-                MITM_HIGH_BITS = hb; MITM_LOW_BITS = lb;
-                MITM_HIGH_SIZE = 1 << hb; MITM_HIGH_MASK = MITM_HIGH_SIZE - 1;
-                MITM_LOW_SIZE = 1 << lb; MITM_LOW_MASK = MITM_LOW_SIZE - 1;
-                LOWER_SIZE = 1 << LOWER_BITS; LOWER_MASK = LOWER_SIZE - 1;
-                cout << "Using HIGH=" << hb << " LOW=" << lb << " (total " << LOWER_BITS << " bits)\n";
-                break;
-            }
-        } else cerr << "Invalid input.\n";
-    }
-}
-
-// ---------- Search phase -------------------------------------------------------
-static void searchWorker(uint64_t start, uint64_t end, bool testMode,
-                         steady_clock::time_point searchStart, Phase& searchStatus) {
-    uint64_t localProc=0;
-    vector<vector<RM1024>> localPermRows(baseSets.size());
-    for(size_t o=0;o<baseSets.size();++o) localPermRows[o].resize(MITM_HIGH_SIZE);
-    const auto& refRows = baseRows;
-
-    for(uint32_t sl10=0; sl10<MITM_LOW_SIZE; ++sl10){
-        if(stopRequested) break;
-        if(testMode && duration<double>(steady_clock::now()-searchStart).count()>=10.0){ stopRequested=true; break; }
-        for(size_t o=0;o<baseSets.size();++o)
-            for(uint32_t r=0;r<MITM_HIGH_SIZE;++r){
-                localPermRows[o][r] = refRows[o][r];
-                xorPerm(localPermRows[o][r], sl10);
-            }
-
-        for(uint64_t base=start; base<end; base+=MITM_LOW_SIZE){
-            if(stopRequested) break;
-            uint64_t curSeedVal = base+sl10;
-            if(curSeedVal >= end) continue;
-            uint32_t seed = uint32_t(curSeedVal);
-            auto feat = MakeFeatureSeed(seed);
-            uint32_t xMul=feat.xMul, zMul=feat.zMul;
-            uint32_t seedLow = seed & LOWER_MASK;
-            uint32_t seedHigh12 = (seedLow >> MITM_LOW_BITS) & MITM_HIGH_MASK;
-
-            for(uint32_t row0=0; row0<MITM_HIGH_SIZE; ++row0){
-                M1024 mask;
-                mask.v[0]=_mm256_loadu_si256((__m256i*)&localPermRows[0][row0].w[0]);
-                mask.v[1]=_mm256_loadu_si256((__m256i*)&localPermRows[0][row0].w[4]);
-                mask.v[2]=_mm256_loadu_si256((__m256i*)&localPermRows[0][row0].w[8]);
-                mask.v[3]=_mm256_loadu_si256((__m256i*)&localPermRows[0][row0].w[12]);
-                bool skip=false;
-
-                for(size_t o=1; o<baseSets.size(); ++o){
-                    int64_t D = int64_t(chunkOffsets[o].first)*xMul + int64_t(chunkOffsets[o].second)*zMul;
-                    uint32_t Dlow = uint32_t(D) & LOWER_MASK;
-                    uint32_t dLow10 = Dlow & MITM_LOW_MASK;
-                    uint32_t dHigh12 = (Dlow >> MITM_LOW_BITS) & MITM_HIGH_MASK;
-                    uint32_t uHigh12 = seedHigh12 ^ row0;
-                    uint32_t sumHigh = (uHigh12 + dHigh12) & MITM_HIGH_MASK;
-                    uint32_t targetRow = seedHigh12 ^ sumHigh;
-
-                    auto getShift = [](unsigned r, uint32_t lowMask)->tuple<unsigned,unsigned,unsigned>{
-                        r &= lowMask; return { r>>6, r&63u, 64u-(r&63u) };
-                    };
-                    auto [wordShift, bitShift, bitShift2] = getShift(dLow10, MITM_LOW_MASK);
-                    bool doShift = (bitShift != 0);
-                    __m128i shiftR = _mm_cvtsi32_si128(bitShift), shiftL = _mm_cvtsi32_si128(bitShift2);
-
-                    M1024 extra;
-                    extra.loadRot(localPermRows[o][targetRow].w, wordShift, shiftR, shiftL, doShift);
-                    extra.bitAnd(avxMask0[dLow10]);
-                    if (dLow10 != 0u) {
-                        uint32_t targetRow1 = seedHigh12 ^ ((sumHigh+1u)&MITM_HIGH_MASK);
-                        M1024 extra1;
-                        extra1.loadRot(localPermRows[o][targetRow1].w, wordShift, shiftR, shiftL, doShift);
-                        extra1.bitAnd(avxMask1[dLow10]);
-                        extra.bitOr(extra1);
-                    }
-                    mask.bitAnd(extra);
-                    if (!mask.any()) { skip=true; break; }
-                }
-                if(skip) continue;
-
-                alignas(32) uint64_t mw[16];
-                _mm256_storeu_si256((__m256i*)&mw[0],mask.v[0]);
-                _mm256_storeu_si256((__m256i*)&mw[4],mask.v[1]);
-                _mm256_storeu_si256((__m256i*)&mw[8],mask.v[2]);
-                _mm256_storeu_si256((__m256i*)&mw[12],mask.v[3]);
-
-                for(int w=0; w<16; ++w){
-                    uint64_t bits = mw[w];
-                    while(bits){
-                        unsigned bit = unsigned(__builtin_ctzll(bits)); bits &= bits-1;
-                        uint32_t uLow10 = uint32_t(w*64 + bit);
-                        uint32_t uHigh12 = seedHigh12 ^ row0;
-                        uint32_t lowVal = seedLow ^ ((uHigh12<<MITM_LOW_BITS) | uLow10);
-
-                        uint32_t startIdx = anchorBucketStart[lowVal];
-                        uint32_t cnt = anchorBucketCount[lowVal];
-                        for(uint32_t k=0; k<cnt; ++k){
-                            uint32_t base0 = anchorValuesFlat[startIdx + k];
-                            uint32_t U = seed ^ base0;
-                            bool ok=true;
-                            for(size_t o=1; o<baseSets.size(); ++o){
-                                int64_t Dv = int64_t(chunkOffsets[o].first)*xMul + int64_t(chunkOffsets[o].second)*zMul;
-                                uint32_t targetBase = seed ^ uint32_t(U + uint32_t(Dv));
-                                if(!binary_search(baseSets[o].begin(), baseSets[o].end(), targetBase)){ ok=false; break; }
-                            }
-                            if(!ok) continue;
-
-                            BestSol sol = nearest(seed, xMul, zMul, U);
-                            if(sol.distance == UINT64_MAX) continue;
-
-                            if(!DW::isWell(int64_t(seed), sol.chunkX, sol.chunkZ)) continue;
-                            bool allWells=true;
-                            for(size_t o=1; o<chunkOffsets.size(); ++o){
-                                int testX = sol.chunkX + chunkOffsets[o].first;
-                                int testZ = sol.chunkZ + chunkOffsets[o].second;
-                                if(!DW::isWell(int64_t(seed), testX, testZ)){ allWells=false; break; }
-                            }
-                            if(!allWells) continue;
-
-                            candidateCount.fetch_add(1); foundCount.fetch_add(1);
-                            addSolution(sol);
-                        }
-                    }
-                }
-            }
-            ++localProc;
-            if((localProc & (FLUSH_INTERVAL-1)) == 0){
-                searchStatus.processed += localProc;
-                localProc = 0;
-            }
+        if (cmd == "split") {
+            splitMode = true;
+            if (!(iss >> hb >> lb)) { cerr << "Invalid split command.\n"; continue; }
+        } else {
+            // try to parse as numbers
+            iss.clear(); iss.seekg(0);
+            if (!(iss >> hb >> lb)) { cerr << "Invalid input.\n"; continue; }
         }
+        if (hb < 1 || lb < 1 || lb > 10) {
+            cerr << "Invalid: LOW_BITS must be between 1 and 10.\n"; continue;
+        }
+        uint32_t totalBits = hb + lb;
+        if (totalBits > 26) {
+            cerr << "Invalid: total bits (high+low) must be ≤ 26.\n"; continue;
+        }
+        iss >> tlim;
+        if (tlim <= 0.0) { cerr << "Time limit must be positive.\n"; continue; }
+
+        // Temporarily set split parameters
+        LOWER_BITS = totalBits;
+        MITM_HIGH_BITS = hb; MITM_LOW_BITS = lb;
+        MITM_HIGH_SIZE = 1 << hb; MITM_HIGH_MASK = MITM_HIGH_SIZE - 1;
+        MITM_LOW_SIZE = 1 << lb; MITM_LOW_MASK = MITM_LOW_SIZE - 1;
+        LOWER_SIZE = 1 << LOWER_BITS; LOWER_MASK = LOWER_SIZE - 1;
+
+        initMasks();
+        buildRowsAndBucket(splitMode);   // builds appropriate row tables & buckets
+
+        atomic<bool> timeUp{false};
+        thread timer([&](){ this_thread::sleep_for(duration<double>(tlim)); timeUp = true; });
+
+        uint64_t seedsDone = 0;
+        auto benchStart = steady_clock::now();
+
+        // Benchmark: for each random seed, build permuted rows for its actual sl10
+        // This matches the real search.
+        while (!timeUp) {
+            uint32_t seed = seedDist(rng);
+            auto feat = MakeFeatureSeed(seed);
+            uint32_t xMul = feat.xMul, zMul = feat.zMul;
+            uint32_t seedLow = seed & LOWER_MASK;
+            uint32_t sl10 = seedLow & MITM_LOW_MASK;
+
+            // Build permuted other rows for this sl10
+            vector<vector<RM1024>> benchOtherRows(otherRows.size());
+            for (size_t o = 0; o < otherRows.size(); ++o) {
+                benchOtherRows[o].resize(MITM_HIGH_SIZE);
+                for (uint32_t r = 0; r < MITM_HIGH_SIZE; ++r) {
+                    benchOtherRows[o][r] = otherRows[o][r];
+                    xorPerm(benchOtherRows[o][r], sl10);
+                }
+            }
+
+            if (!splitMode) {
+                vector<vector<RM1024>> benchAnchor(1, vector<RM1024>(MITM_HIGH_SIZE));
+                for (uint32_t r = 0; r < MITM_HIGH_SIZE; ++r) {
+                    benchAnchor[0][r] = baseRows[0][r];
+                    xorPerm(benchAnchor[0][r], sl10);
+                }
+                searchOneSeed(seed, xMul, zMul, benchAnchor, benchOtherRows,
+                              anchorBucketStart, anchorBucketCount, anchorValuesFlat);
+            } else {
+                vector<vector<RM1024>> benchAnchor0(1, vector<RM1024>(MITM_HIGH_SIZE));
+                vector<vector<RM1024>> benchAnchor1(1, vector<RM1024>(MITM_HIGH_SIZE));
+                for (uint32_t r = 0; r < MITM_HIGH_SIZE; ++r) {
+                    benchAnchor0[0][r] = baseRowsSplit[0][0][r];
+                    xorPerm(benchAnchor0[0][r], sl10);
+                    benchAnchor1[0][r] = baseRowsSplit[1][0][r];
+                    xorPerm(benchAnchor1[0][r], sl10);
+                }
+                searchOneSeed(seed, xMul, zMul, benchAnchor0, benchOtherRows,
+                              anchorBucketStartSplit[0], anchorBucketCountSplit[0], anchorValuesFlatSplit[0]);
+                searchOneSeed(seed, xMul, zMul, benchAnchor1, benchOtherRows,
+                              anchorBucketStartSplit[1], anchorBucketCountSplit[1], anchorValuesFlatSplit[1]);
+            }
+            ++seedsDone;
+        }
+
+        timer.join();
+        auto benchEnd = steady_clock::now();
+        double elapsed = duration<double>(benchEnd - benchStart).count();
+        if (seedsDone == 0) cout << "No seeds processed.\n";
+        else cout << seedsDone << " seeds in " << elapsed << " s ("
+                  << (elapsed * 1e6 / seedsDone) << " µs/seed) "
+                  << (splitMode ? "[split]" : "[full]") << "\n";
     }
-    searchStatus.processed += localProc;
 }
 
 // ---------- Main (with fixed‑block resume) ------------------------------------
@@ -794,8 +861,15 @@ int main() {
     if (testMode && stopRequested) cerr << "Base scan time limit reached.\n";
     stopRequested.store(false);
 
+    bool useSplitMode = false;
     if (!testMode) {
-        interactiveTune();
+        cout << "Enable split‑base mode? (y/n): " << flush;
+        char ans; cin >> ans;
+        useSplitMode = (ans == 'y' || ans == 'Y');
+    }
+
+    if (!testMode) {
+        interactiveTune();   // still allows user to pick best split
     } else {
         LOWER_BITS = 22; MITM_HIGH_BITS = 12; MITM_LOW_BITS = 10;
         MITM_HIGH_SIZE = 1 << 12; MITM_HIGH_MASK = MITM_HIGH_SIZE - 1;
@@ -803,12 +877,11 @@ int main() {
         LOWER_SIZE = 1 << 22; LOWER_MASK = LOWER_SIZE - 1;
     }
     initMasks();
-    buildRowsAndBucket();
+    buildRowsAndBucket(useSplitMode);   // build row tables for chosen mode
 
-    // --- Fixed‑block decomposition for the full 2^32 space ---
+    // --- Fixed‑block decomposition ---
     uint64_t totalSeeds = TOTAL_UINT32;
     unsigned threadCount = thread::hardware_concurrency(); if(threadCount==0) threadCount=1;
-    // Full‑scan block size (used for both fresh and resume)
     uint64_t fullBlockSize = (totalSeeds + threadCount - 1) / threadCount;
     fullBlockSize = (fullBlockSize + MITM_LOW_MASK) & ~uint64_t(MITM_LOW_MASK);
 
@@ -821,39 +894,29 @@ int main() {
             cout << "Enter percentage already scanned (e.g. 3.1): " << flush;
             cin >> pct;
             uint64_t rawSkip = uint64_t(pct * 0.01 * totalSeeds);
-            // Align to MITM_LOW_SIZE to avoid mid‑seed issues
             skipSeeds = (rawSkip / MITM_LOW_SIZE) * MITM_LOW_SIZE;
             cerr << "Resuming from seed " << skipSeeds << " (aligned).\n";
         }
     }
 
-    // Compute block index containing skipSeeds
-    uint64_t blockIndex = skipSeeds / fullBlockSize;   // block that was partially or fully done
-    uint64_t offsetInBlock = skipSeeds % fullBlockSize; // where to start inside that block
+    uint64_t blockIndex = skipSeeds / fullBlockSize;
+    uint64_t offsetInBlock = skipSeeds % fullBlockSize;
 
-    // Build list of remaining block indices (blockIndex .. threadCount-1)
     vector<unsigned> blockIndices;
-    for (unsigned b = blockIndex; b < threadCount; ++b) {
-        blockIndices.push_back(b);
-    }
-    // Shuffle the block indices (except keep the first one at front if we need to start mid‑block)
-    // We'll handle the first block specially if offsetInBlock > 0.
-    // Shuffle all indices; then manually ensure the partial block is processed correctly.
+    for (unsigned b = blockIndex; b < threadCount; ++b) blockIndices.push_back(b);
     {
         random_device rd;
         mt19937 rng(rd());
         shuffle(blockIndices.begin(), blockIndices.end(), rng);
     }
 
-    // Prepare thread ranges
     vector<pair<uint64_t,uint64_t>> threadRanges(blockIndices.size());
     for (size_t i = 0; i < blockIndices.size(); ++i) {
         unsigned b = blockIndices[i];
         uint64_t blockStart = uint64_t(b) * fullBlockSize;
         uint64_t blockEnd = min(blockStart + fullBlockSize, totalSeeds);
         if (b == blockIndex && offsetInBlock > 0) {
-            // This is the partial block where we resume
-            blockStart = skipSeeds;   // start from skipSeeds
+            blockStart = skipSeeds;
         }
         threadRanges[i] = {blockStart, blockEnd};
     }
@@ -867,7 +930,7 @@ int main() {
         uint64_t start = threadRanges[i].first;
         uint64_t end = threadRanges[i].second;
         searchThreads.emplace_back([&, start, end]() {
-            searchWorker(start, end, testMode, searchStart, searchStatus);
+            searchWorker(start, end, testMode, searchStart, searchStatus, useSplitMode);
         });
     }
 
