@@ -170,6 +170,15 @@ static inline __m256i swapBits256(__m256i v, __m256i mask, int shift) noexcept {
     return _mm256_xor_si256(_mm256_xor_si256(v, t), _mm256_slli_epi64(t, shift));
 }
 
+// xorPerm(row, x): implements output[i] = input[i XOR x] over the low
+// MITM_LOW_SIZE-bit domain, PLUS duplicates the (permuted) lower 16 words
+// into the upper 16 words of the 32-word RM1024 buffer. That duplication is
+// what makes the wraparound-shifted reads in loadRot() safe (they read up
+// to ~wordShift+16 words in, always <= 31). Calling this with x == 0 is a
+// legitimate use: it performs no permutation but still produces the
+// duplicate padding, which offsets >= 1 need (since their rows are indexed
+// by an additive shift, not this XOR permutation) but only needs to be done
+// once, not per-sl10.
 static inline void xorPerm(RM1024 &m, uint32_t x) noexcept {
     __m256i v0 = _mm256_loadu_si256((__m256i*)&m.w[0]);
     __m256i v1 = _mm256_loadu_si256((__m256i*)&m.w[4]);
@@ -379,6 +388,60 @@ static void buildOffsetSetsFromCache() {
     cerr << '\n';
 }
 
+// ---------- Session save/load ---------------------------------------------------
+// (This existed in the earlier slow reference version but was dropped in this
+//  AVX rewrite. Re-added: lets you skip readFormation()/interactiveTune() on
+//  a later run by restoring the chunk-offset formation and the HIGH/LOW bit
+//  split from a file.)
+static void saveSession(const string& filename) {
+    ofstream ofs(filename);
+    if (!ofs) { cerr << "Failed to save session.\n"; return; }
+    ofs << MITM_HIGH_BITS << " " << MITM_LOW_BITS << " " << chunkOffsets.size() << "\n";
+    for (size_t i = 0; i < chunkOffsets.size(); ++i) {
+        ofs << chunkOffsets[i].first << " " << chunkOffsets[i].second
+            << " " << criteria[i].rangesX.size();
+        for (auto& r : criteria[i].rangesX) ofs << " " << r.first << " " << r.second;
+        ofs << " " << criteria[i].rangesZ.size();
+        for (auto& r : criteria[i].rangesZ) ofs << " " << r.first << " " << r.second;
+        ofs << "\n";
+    }
+    cout << "Session saved to " << filename << "\n";
+}
+
+static bool loadSession(const string& filename) {
+    ifstream ifs(filename);
+    if (!ifs) return false;
+    uint32_t hb, lb, nOffsets;
+    if (!(ifs >> hb >> lb >> nOffsets)) return false;
+    if (hb < 1 || lb < 1 || lb > 10 || (hb + lb) > 26) {
+        cerr << "Invalid split in session file.\n";
+        return false;
+    }
+
+    LOWER_BITS = hb + lb;
+    MITM_HIGH_BITS = hb; MITM_LOW_BITS = lb;
+    MITM_HIGH_SIZE = 1 << hb; MITM_HIGH_MASK = MITM_HIGH_SIZE - 1;
+    MITM_LOW_SIZE = 1 << lb; MITM_LOW_MASK = MITM_LOW_SIZE - 1;
+    LOWER_SIZE = 1 << LOWER_BITS; LOWER_MASK = LOWER_SIZE - 1;
+
+    chunkOffsets.resize(nOffsets);
+    criteria.resize(nOffsets);
+    baseSets.resize(nOffsets);
+
+    for (uint32_t i = 0; i < nOffsets; ++i) {
+        ifs >> chunkOffsets[i].first >> chunkOffsets[i].second;
+        uint32_t rx, rz;
+        ifs >> rx;
+        criteria[i].rangesX.resize(rx);
+        for (uint32_t r = 0; r < rx; ++r) ifs >> criteria[i].rangesX[r].first >> criteria[i].rangesX[r].second;
+        ifs >> rz;
+        criteria[i].rangesZ.resize(rz);
+        for (uint32_t r = 0; r < rz; ++r) ifs >> criteria[i].rangesZ[r].first >> criteria[i].rangesZ[r].second;
+    }
+    cout << "Session loaded: " << nOffsets << " offsets, HIGH=" << hb << " LOW=" << lb << "\n";
+    return true;
+}
+
 // ---------- Top‑10 solution tracking & file output -----------------------------
 static const int TOP_K = 10;
 static vector<BestSol> topSolutions;
@@ -481,6 +544,19 @@ static void buildRowsAndBucket(){
             baseRows[i][row].w[col>>6] |= 1ULL<<(col&63);
         }
     }
+    // FIX: offsets >= 1 are addressed by an ADDITIVE shift (wordShift/bitShift
+    // + carryMask), not by the sl10 XOR permutation -- that permutation must
+    // only ever be applied to offset 0. They still need the duplicate-padding
+    // that xorPerm() produces (so the wraparound-shifted reads in loadRot()
+    // stay in-bounds and semantically correct), so pad them ONCE here with an
+    // identity permutation (x=0). This replaces the old per-sl10,
+    // per-offset xorPerm(..., sl10) call that was corrupting these rows.
+    for(size_t i=1;i<baseRows.size();++i){
+        for(uint32_t r=0;r<MITM_HIGH_SIZE;++r){
+            xorPerm(baseRows[i][r], 0u);
+        }
+    }
+
     const auto& set0 = baseSets[0];
     anchorValuesFlat = set0;
     sort(anchorValuesFlat.begin(), anchorValuesFlat.end(), [](uint32_t a,uint32_t b){
@@ -538,6 +614,13 @@ static void interactiveTune() {
 
                 uint64_t seedsDone = 0;
                 auto benchStart = steady_clock::now();
+                // FIX: only offset 0's rows depend on sl10 -- precompute a
+                // permuted copy of offset 0 per sl10, and reference
+                // baseRows[o] (o >= 1) directly (already padded once in
+                // buildRowsAndBucket()). Previously this rebuilt permuted
+                // copies of ALL offsets on every single sampled seed, which
+                // was both wasteful and (per the note above) incorrect.
+                vector<RM1024> anchorPermRows(MITM_HIGH_SIZE);
                 while (!timeUp) {
                     uint32_t seed = seedDist(rng);
                     auto feat = MakeFeatureSeed(seed);
@@ -546,21 +629,17 @@ static void interactiveTune() {
                     uint32_t sl10 = seedLow & MITM_LOW_MASK;
                     uint32_t seedHigh12 = (seedLow >> MITM_LOW_BITS) & MITM_HIGH_MASK;
 
-                    vector<vector<RM1024>> permRows(baseSets.size());
-                    for (size_t o = 0; o < baseSets.size(); ++o) {
-                        permRows[o].resize(MITM_HIGH_SIZE);
-                        for (uint32_t r = 0; r < MITM_HIGH_SIZE; ++r) {
-                            permRows[o][r] = baseRows[o][r];
-                            xorPerm(permRows[o][r], sl10);
-                        }
+                    for (uint32_t r = 0; r < MITM_HIGH_SIZE; ++r) {
+                        anchorPermRows[r] = baseRows[0][r];
+                        xorPerm(anchorPermRows[r], sl10);
                     }
 
                     for (uint32_t row0 = 0; row0 < MITM_HIGH_SIZE && !timeUp; ++row0) {
                         M1024 mask;
-                        mask.v[0] = _mm256_loadu_si256((__m256i*)&permRows[0][row0].w[0]);
-                        mask.v[1] = _mm256_loadu_si256((__m256i*)&permRows[0][row0].w[4]);
-                        mask.v[2] = _mm256_loadu_si256((__m256i*)&permRows[0][row0].w[8]);
-                        mask.v[3] = _mm256_loadu_si256((__m256i*)&permRows[0][row0].w[12]);
+                        mask.v[0] = _mm256_loadu_si256((__m256i*)&anchorPermRows[row0].w[0]);
+                        mask.v[1] = _mm256_loadu_si256((__m256i*)&anchorPermRows[row0].w[4]);
+                        mask.v[2] = _mm256_loadu_si256((__m256i*)&anchorPermRows[row0].w[8]);
+                        mask.v[3] = _mm256_loadu_si256((__m256i*)&anchorPermRows[row0].w[12]);
                         bool skip = false;
                         for (size_t o = 1; o < baseSets.size(); ++o) {
                             int64_t D = int64_t(chunkOffsets[o].first)*xMul + int64_t(chunkOffsets[o].second)*zMul;
@@ -578,12 +657,12 @@ static void interactiveTune() {
                             bool doShift = (bitShift != 0);
                             __m128i shiftR = _mm_cvtsi32_si128(bitShift), shiftL = _mm_cvtsi32_si128(bitShift2);
                             M1024 extra;
-                            extra.loadRot(permRows[o][targetRow].w, wordShift, shiftR, shiftL, doShift);
+                            extra.loadRot(baseRows[o][targetRow].w, wordShift, shiftR, shiftL, doShift);
                             extra.bitAnd(avxMask0[dLow10]);
                             if (dLow10 != 0u) {
                                 uint32_t targetRow1 = seedHigh12 ^ ((sumHigh+1u)&MITM_HIGH_MASK);
                                 M1024 extra1;
-                                extra1.loadRot(permRows[o][targetRow1].w, wordShift, shiftR, shiftL, doShift);
+                                extra1.loadRot(baseRows[o][targetRow1].w, wordShift, shiftR, shiftL, doShift);
                                 extra1.bitAnd(avxMask1[dLow10]);
                                 extra.bitOr(extra1);
                             }
@@ -616,6 +695,7 @@ static void interactiveTune() {
                                         uint32_t targetBase = seed ^ uint32_t(U + uint32_t(Dv));
                                         if (!binary_search(baseSets[o].begin(), baseSets[o].end(), targetBase)) { ok = false; break; }
                                     }
+                                    (void)ok; // benchmarking only, matches searchWorker's control flow cost
                                 }
                             }
                         }
@@ -634,6 +714,14 @@ static void interactiveTune() {
                 MITM_LOW_SIZE = 1 << lb; MITM_LOW_MASK = MITM_LOW_SIZE - 1;
                 LOWER_SIZE = 1 << LOWER_BITS; LOWER_MASK = LOWER_SIZE - 1;
                 cout << "Using HIGH=" << hb << " LOW=" << lb << " (total " << LOWER_BITS << " bits)\n";
+
+                cout << "Save this configuration to a session file? (y/n): " << flush;
+                char ans; cin >> ans;
+                if (ans == 'y' || ans == 'Y') {
+                    cout << "Enter session filename: " << flush;
+                    string fname; cin >> fname;
+                    saveSession(fname);
+                }
                 break;
             }
         } else cerr << "Invalid input.\n";
@@ -644,18 +732,19 @@ static void interactiveTune() {
 static void searchWorker(uint64_t start, uint64_t end, bool testMode,
                          steady_clock::time_point searchStart, Phase& searchStatus) {
     uint64_t localProc=0;
-    vector<vector<RM1024>> localPermRows(baseSets.size());
-    for(size_t o=0;o<baseSets.size();++o) localPermRows[o].resize(MITM_HIGH_SIZE);
+    // FIX: only offset 0 needs a per-sl10 permuted copy. Offsets >= 1 are
+    // referenced directly from baseRows (refRows) below -- they were padded
+    // once in buildRowsAndBucket() and never need to change with sl10.
+    vector<RM1024> anchorPermRows(MITM_HIGH_SIZE);
     const auto& refRows = baseRows;
 
     for(uint32_t sl10=0; sl10<MITM_LOW_SIZE; ++sl10){
         if(stopRequested) break;
         if(testMode && duration<double>(steady_clock::now()-searchStart).count()>=10.0){ stopRequested=true; break; }
-        for(size_t o=0;o<baseSets.size();++o)
-            for(uint32_t r=0;r<MITM_HIGH_SIZE;++r){
-                localPermRows[o][r] = refRows[o][r];
-                xorPerm(localPermRows[o][r], sl10);
-            }
+        for(uint32_t r=0;r<MITM_HIGH_SIZE;++r){
+            anchorPermRows[r] = refRows[0][r];
+            xorPerm(anchorPermRows[r], sl10);
+        }
 
         for(uint64_t base=start; base<end; base+=MITM_LOW_SIZE){
             if(stopRequested) break;
@@ -669,10 +758,10 @@ static void searchWorker(uint64_t start, uint64_t end, bool testMode,
 
             for(uint32_t row0=0; row0<MITM_HIGH_SIZE; ++row0){
                 M1024 mask;
-                mask.v[0]=_mm256_loadu_si256((__m256i*)&localPermRows[0][row0].w[0]);
-                mask.v[1]=_mm256_loadu_si256((__m256i*)&localPermRows[0][row0].w[4]);
-                mask.v[2]=_mm256_loadu_si256((__m256i*)&localPermRows[0][row0].w[8]);
-                mask.v[3]=_mm256_loadu_si256((__m256i*)&localPermRows[0][row0].w[12]);
+                mask.v[0]=_mm256_loadu_si256((__m256i*)&anchorPermRows[row0].w[0]);
+                mask.v[1]=_mm256_loadu_si256((__m256i*)&anchorPermRows[row0].w[4]);
+                mask.v[2]=_mm256_loadu_si256((__m256i*)&anchorPermRows[row0].w[8]);
+                mask.v[3]=_mm256_loadu_si256((__m256i*)&anchorPermRows[row0].w[12]);
                 bool skip=false;
 
                 for(size_t o=1; o<baseSets.size(); ++o){
@@ -692,12 +781,12 @@ static void searchWorker(uint64_t start, uint64_t end, bool testMode,
                     __m128i shiftR = _mm_cvtsi32_si128(bitShift), shiftL = _mm_cvtsi32_si128(bitShift2);
 
                     M1024 extra;
-                    extra.loadRot(localPermRows[o][targetRow].w, wordShift, shiftR, shiftL, doShift);
+                    extra.loadRot(refRows[o][targetRow].w, wordShift, shiftR, shiftL, doShift);
                     extra.bitAnd(avxMask0[dLow10]);
                     if (dLow10 != 0u) {
                         uint32_t targetRow1 = seedHigh12 ^ ((sumHigh+1u)&MITM_HIGH_MASK);
                         M1024 extra1;
-                        extra1.loadRot(localPermRows[o][targetRow1].w, wordShift, shiftR, shiftL, doShift);
+                        extra1.loadRot(refRows[o][targetRow1].w, wordShift, shiftR, shiftL, doShift);
                         extra1.bitAnd(avxMask1[dLow10]);
                         extra.bitOr(extra1);
                     }
@@ -766,11 +855,30 @@ int main() {
     ios::sync_with_stdio(false); cin.tie(nullptr);
     signal(SIGINT, [](int){ stopRequested = true; });
 
-    readFormation();
+    cout << "Load session file? (y/n): " << flush;
+    char loadAns; cin >> loadAns;
+    bool loadedSession = false;
+    if (loadAns == 'y' || loadAns == 'Y') {
+        cout << "Enter session filename: " << flush;
+        string fname; cin >> fname;
+        if (!loadSession(fname)) {
+            cerr << "Failed to load session. Exiting.\n";
+            return 1;
+        }
+        loadedSession = true;
+    } else {
+        readFormation();
+    }
 
-    cout << "Enter mode (1 = normal, 2 = test): " << flush;
-    int mode; cin >> mode;
-    bool testMode = (mode == 2);
+    // A loaded session already fixes the HIGH/LOW split and formation, so
+    // (matching the earlier reference version) we skip the mode prompt and
+    // go straight to a real (non-test) run.
+    bool testMode = false;
+    if (!loadedSession) {
+        cout << "Enter mode (1 = normal, 2 = test): " << flush;
+        int mode; cin >> mode;
+        testMode = (mode == 2);
+    }
 
     // --- Universal well base cache ---
     string wellCacheFile = "well_bases.bin";
@@ -794,7 +902,10 @@ int main() {
     if (testMode && stopRequested) cerr << "Base scan time limit reached.\n";
     stopRequested.store(false);
 
-    if (!testMode) {
+    if (loadedSession) {
+        cout << "Using loaded session: HIGH=" << MITM_HIGH_BITS << " LOW=" << MITM_LOW_BITS
+             << " (total " << LOWER_BITS << " bits)\n";
+    } else if (!testMode) {
         interactiveTune();
     } else {
         LOWER_BITS = 22; MITM_HIGH_BITS = 12; MITM_LOW_BITS = 10;
@@ -836,9 +947,6 @@ int main() {
     for (unsigned b = blockIndex; b < threadCount; ++b) {
         blockIndices.push_back(b);
     }
-    // Shuffle the block indices (except keep the first one at front if we need to start mid‑block)
-    // We'll handle the first block specially if offsetInBlock > 0.
-    // Shuffle all indices; then manually ensure the partial block is processed correctly.
     {
         random_device rd;
         mt19937 rng(rd());
